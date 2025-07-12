@@ -1,0 +1,67 @@
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["crrow"]
+
+# [[example]]
+# name = "hello-world"
+# path = "examples/hello_world.rs"
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/api",
+    "crates/cmd",
+    "crates/common",
+    "crates/server",
+]
+
+exclude = [
+    "target", # exclude bench testing
+]
+
+[workspace.dependencies]
+actix = "^0.13.5"
+async-trait = "^0.1.88"
+axum = "^0.8.4"
+bon = "^3.6.4"
+defer = "^0.2.1"
+futures = "^0.3.31"
+prost = "^0.14.1"
+protobuf = "^3.7.2"
+serde = { version = "^1.0.219", features = ["derive"] }
+snafu = "^0.8.6"
+strum = "^0.27.1"
+strum_macros = "^0.27.1"
+tokio = { version = "^1.45.1", features = ["full", "tracing"] }
+tokio-util = "^0.7.15"
+tonic = "^0.13.1"
+tonic-build = "^0.13.1"
+tonic-health = "^0.13.1"
+tonic-reflection = "^0.13.1"
+tonic-web = "^0.13.1"
+tower = "^0.5.2"
+tower-http = { version = "^0.6.6", features = ["cors"] }
+tracing = "^0.1.41"
+tracing-subscriber = "^0.3.18"
+
+# Config for 'cargo dist'
+[workspace.metadata.dist]
+# The preferred cargo-dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.12.2"
+# CI backends to support
+ci = ["github"]
+# The installers to generate for each app
+installers = ["shell", "powershell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Publish jobs to run in CI
+pr-run-mode = "upload"
+# Whether to install an updater program
+install-updater = false
+
+# The profile that 'cargo dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
