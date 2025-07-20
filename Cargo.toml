@@ -13,6 +13,7 @@ resolver = "2"
 members = [
     "crates/api",
     "crates/cmd",
+    "crates/db",
     "crates/common",
     "crates/server",
 ]
@@ -25,15 +26,22 @@ exclude = [
 actix = "^0.13.5"
 async-trait = "^0.1.88"
 axum = "^0.8.4"
+bincode = "2.0.1"
 bon = "^3.6.4"
+byteorder = "1.5.0"
+crc32fast = "1.5.0"
 defer = "^0.2.1"
+derive_more = { version = "2.0.1", features = ["from", "into"] }
 futures = "^0.3.31"
-prost = "^0.14.1"
+prost = "^0.13.1"
+prost-types = "^0.13.1"
 protobuf = "^3.7.2"
+rangemap = "1.5.1"
 serde = { version = "^1.0.219", features = ["derive"] }
 snafu = "^0.8.6"
 strum = "^0.27.1"
 strum_macros = "^0.27.1"
+test-case = "^3.3.1"
 tokio = { version = "^1.45.1", features = ["full", "tracing"] }
 tokio-util = "^0.7.15"
 tonic = "^0.13.1"
@@ -44,7 +52,7 @@ tonic-web = "^0.13.1"
 tower = "^0.5.2"
 tower-http = { version = "^0.6.6", features = ["cors"] }
 tracing = "^0.1.41"
-tracing-subscriber = "^0.3.18"
+tracing-subscriber = { version = "^0.3.18", features = ["fmt"] }
 
 # Config for 'cargo dist'
 [workspace.metadata.dist]

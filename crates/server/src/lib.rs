@@ -14,6 +14,7 @@
 
 pub mod grpc;
 pub mod http;
+pub mod services;
 
 use futures::future::join_all;
 use snafu::Snafu;

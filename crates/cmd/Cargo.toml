@@ -11,7 +11,11 @@ clap = { version = "4.4.16", features = ["derive"] }
 const_format = "0.2.32"
 ctrlc = "3.4.2"
 human-panic = "2.0.0"
+rsketch-server = { path = "../server" }
 snafu.workspace = true
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [build-dependencies]
 built = { version = "0.8.0", features = ["git2"] }

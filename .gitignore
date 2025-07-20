@@ -8,6 +8,7 @@ book/
 docs/node_modules/
 result/*
 .env
+bin/
 
 # OSX leaves these everywhere on SMB shares
 ._*

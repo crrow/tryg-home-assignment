@@ -1,26 +1,19 @@
-# Just my personal rust project template.
+# A simple key-value-timestamp store
 
-Quick set up a rust project with clap cli tools.
+Key-value-timestamp store Implement a key-value-timestamp store in whichever programming language you prefer. You are encouraged to use any frameworks and libraries you deem appropriate.
 
-## Features
+## Specification
 
-- [x] clap
-- [x] proto
-- [x] convenient just recipes
-- [x] mdbook
-- [x] github action
-- [x] changelog
+1. Data should be persisted through process restarts (stored on disk).
 
-## Fetch changes from template-repo.
+2. The application should support PUT and GET apis. While the data does not need to be exposed over a network, this is a language agnostic example to illustrate how the application could be called:
 
-```shell
+    1: `curl -X PUT http://localhost:8080 -H 'Content-Type: application/json' -d '{"key": "mykey", "value": "myvalue", "timestamp" : 1673524092123456}'`
 
-git remote add template https://github.com/HaHadaxigua/rust_template
+    2: `curl -X GET http://localhost:8080 -H 'Content-Type: application/json' -d '{"key":"mykey", "timestamp": 1673524092123456}'` # returns "myvalue"
 
-git fetch template
+3. Lookups should consider the key-timestamp combination. For example, given the stored sequence:`[{key: "mykey", timestamp: 100, value: "value1"}, {key: "mykey", timestamp: 101, value: "value2"}]` a request for "mykey" at timestamp 99 should return nothing, a request at timestamp 100 should return "value1" and a request at timestamp 101 or higher should return "value2".
 
-git merge template/main
+4. Your solution should have defined outcomes for concurrent API calls.
 
-```
-
-[![Built with Devbox](https://jetpack.io/img/devbox/shield_galaxy.svg)](https://jetpack.io/devbox/docs/contributor-quickstart/)
+5. Document how to build and run your solution from the command line. For example: "go run main.go".

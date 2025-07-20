@@ -12,20 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use serde;
+use clap::Args;
+use snafu::Whatever;
 
-pub mod pb {
-    pub const GRPC_DESC: &[u8] = tonic::include_file_descriptor_set!("rsketch_grpc_desc");
+#[derive(Debug, Clone, Args)]
+#[command(flatten_help = true)]
+#[command(long_about = r"
 
-    pub mod hello {
-        pub mod v1 {
-            tonic::include_proto!("hello.v1");
-        }
-    }
+Print hello.
+Examples:
 
-    pub mod store {
-        pub mod v1 {
-            tonic::include_proto!("store.v1");
-        }
-    }
+rsketch hello
+")]
+pub(crate) struct HelloArgs {}
+
+pub(crate) async fn run(_args: HelloArgs) -> Result<(), Whatever> {
+    println!("Hello, world!");
+    Ok(())
 }

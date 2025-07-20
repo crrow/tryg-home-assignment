@@ -41,7 +41,7 @@ pub struct GrpcServerConfig {
     /// The address to bind the gRPC server
     pub bind_address:          String,
     /// The address to advertise to clients
-    pub server_address:        String,
+    pub server_address:        Option<String>,
     /// Maximum gRPC receiving (decoding) message size
     pub max_recv_message_size: ReadableSize,
     /// Maximum gRPC sending (encoding) message size
@@ -52,10 +52,22 @@ impl Default for GrpcServerConfig {
     fn default() -> Self {
         Self {
             bind_address:          "127.0.0.1:50051".to_string(),
-            server_address:        "127.0.0.1:50051".to_string(),
+            server_address:        None,
             max_recv_message_size: DEFAULT_MAX_GRPC_RECV_MESSAGE_SIZE,
             max_send_message_size: DEFAULT_MAX_GRPC_SEND_MESSAGE_SIZE,
         }
+    }
+}
+
+impl GrpcServerConfig {
+    pub fn with_address(mut self, address: String) -> Self {
+        self.bind_address = address;
+        self
+    }
+
+    pub fn with_server_address(mut self, address: String) -> Self {
+        self.server_address = Some(address);
+        self
     }
 }
 
@@ -323,7 +335,7 @@ mod tests {
         // Create a gRPC client and send an RPC request
         let mut client = rsketch_api::pb::hello::v1::hello_client::HelloClient::connect(format!(
             "http://{}",
-            config.server_address
+            config.server_address.unwrap()
         ))
         .await
         .unwrap();

@@ -92,7 +92,7 @@ impl Serialize for ReadableSize {
         let size = self.0;
         let mut buffer = String::new();
         if size == 0 {
-            write!(buffer, "{}KiB", size).unwrap();
+            write!(buffer, "{size}KiB").unwrap();
         } else if size % PIB == 0 {
             write!(buffer, "{}PiB", size / PIB).unwrap();
         } else if size % TIB == 0 {
@@ -117,11 +117,11 @@ impl FromStr for ReadableSize {
     fn from_str(s: &str) -> Result<ReadableSize, String> {
         let size_str = s.trim();
         if size_str.is_empty() {
-            return Err(format!("{:?} is not a valid size.", s));
+            return Err(format!("{s:?} is not a valid size."));
         }
 
         if !size_str.is_ascii() {
-            return Err(format!("ASCII string is expected, but got {:?}", s));
+            return Err(format!("ASCII string is expected, but got {s:?}"));
         }
 
         // size: digits and '.' as decimal separator
@@ -143,21 +143,20 @@ impl FromStr for ReadableSize {
             "B" | "" => B,
             _ => {
                 return Err(format!(
-                    "only B, KB, KiB, MB, MiB, GB, GiB, TB, TiB, PB, and PiB are supported: {:?}",
-                    s
+                    "only B, KB, KiB, MB, MiB, GB, GiB, TB, TiB, PB, and PiB are supported: {s:?}"
                 ));
             }
         };
 
         match size.parse::<f64>() {
             Ok(n) => Ok(ReadableSize((n * unit as f64) as u64)),
-            Err(_) => Err(format!("invalid size string: {:?}", s)),
+            Err(_) => Err(format!("invalid size string: {s:?}")),
         }
     }
 }
 
 impl Debug for ReadableSize {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self}") }
 }
 
 impl Display for ReadableSize {

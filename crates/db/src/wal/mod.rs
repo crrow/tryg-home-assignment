@@ -12,20 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use serde;
-
-pub mod pb {
-    pub const GRPC_DESC: &[u8] = tonic::include_file_descriptor_set!("rsketch_grpc_desc");
-
-    pub mod hello {
-        pub mod v1 {
-            tonic::include_proto!("hello.v1");
-        }
-    }
-
-    pub mod store {
-        pub mod v1 {
-            tonic::include_proto!("store.v1");
-        }
-    }
-}
+mod writer;

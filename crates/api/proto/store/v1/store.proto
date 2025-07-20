@@ -16,10 +16,32 @@
 
 syntax = "proto3";
 
-package hello.v1;
+package store.v1;
 
 import "google/protobuf/empty.proto";
 
-service Hello {
-  rpc Hello(google.protobuf.Empty) returns (google.protobuf.Empty);
+service Store {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Set(SetRequest) returns (google.protobuf.Empty);
 }
+
+message Series {
+    string key = 1;
+    string value = 2;
+    int64 timestamp = 3;
+}
+
+message GetRequest {
+    string key = 1;
+    // if the timestamp is not provided, the latest value will be returned
+    optional int64 timestamp = 2;
+}
+
+message GetResponse {
+    Series series = 1;
+}
+
+message SetRequest {
+    Series series = 1;
+}
+

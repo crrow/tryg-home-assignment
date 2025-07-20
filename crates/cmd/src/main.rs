@@ -12,47 +12,67 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use snafu::Whatever;
+use tracing::info;
+
 mod build_info;
+mod command_hello;
+mod command_server;
 
 #[derive(Debug, Parser)]
-#[clap(
-name = "rsketch",
-about= "rsketch-cmd",
-author = build_info::AUTHOR,
-version = build_info::FULL_VERSION)]
+#[command(
+    name = "rsketch",
+    about = "Time series engine command line interface",
+    author = build_info::AUTHOR,
+    version = build_info::FULL_VERSION,
+    propagate_version = true
+)]
 struct Cli {
     #[command(subcommand)]
-    commands: Commands,
+    command: Commands,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    Hello(HelloArgs),
+    /// Print a hello message
+    Hello(command_hello::HelloArgs),
+    /// Run the time series server
+    Server(command_server::ServerArgs),
 }
 
-#[derive(Debug, Clone, Args)]
-#[command(flatten_help = true)]
-#[command(long_about = r"
+#[tokio::main]
+async fn main() -> Result<(), Whatever> {
+    // Initialize logging
+    // Start configuring a `fmt` subscriber
+    let subscriber = tracing_subscriber::fmt()
+    // Use a more compact, abbreviated log format
+    .compact()
+    // Display source code file paths
+    .with_file(true)
+    // Display source code line numbers
+    .with_line_number(true)
+    // Display the thread ID an event was recorded on
+    .with_thread_ids(true)
+    // Don't display the event's target (module path)
+    .with_target(false)
+    // Build the subscriber
+    .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set global default");
 
-Print hello.
-Examples:
-
-rsketch hello
-")]
-struct HelloArgs {}
-
-impl HelloArgs {
-    fn run(&self) -> Result<(), Whatever> {
-        println!("Hello, world!");
-        Ok(())
-    }
-}
-
-fn main() -> Result<(), Whatever> {
+    // Parse command line arguments
     let cli = Cli::parse();
-    match cli.commands {
-        Commands::Hello(ha) => ha.run(),
+
+    info!("Starting rsketch version {}", build_info::FULL_VERSION);
+
+    // Execute the selected command
+    match cli.command {
+        Commands::Hello(args) => {
+            command_hello::run(args).await?;
+        }
+        Commands::Server(args) => {
+            command_server::run(args).await?;
+        }
     }
+    Ok(())
 }

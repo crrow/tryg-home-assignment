@@ -27,6 +27,7 @@ fn main() {
         // .type_attribute("rsketch.v1.hello.Message", EQ_ATTR)
         .compile_protos(&[
             "proto/hello/v1/hello.proto",
+            "proto/store/v1/store.proto",
         ], &["proto"])
         .expect("compile proto");
 }

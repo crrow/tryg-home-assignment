@@ -3,6 +3,7 @@
     just -l
 
 @fmt:
+    cargo clippy --fix --allow-dirty --allow-staged -- -W unused-imports
     cargo +nightly fmt --all
     taplo format
     taplo format --check
@@ -33,3 +34,10 @@ alias c := check
 alias t := test
 @test:
     cargo nextest run --verbose
+
+@build-cli:
+    # Build the rsketch-cmd package
+    cargo build --package rsketch-cmd
+
+@run-cli:
+    cargo run --package rsketch-cmd server
