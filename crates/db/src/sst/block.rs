@@ -12,9 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{SeekFrom, Write};
+use std::{
+    collections::HashMap,
+    fs::File,
+    hash::Hash,
+    io::{IoSlice, Read, Seek, SeekFrom, Write},
+    sync::{Arc, Mutex},
+};
 
-use crate::format::{Codec, Entry, IndexEntry, InternalKey};
+use byteorder::ReadBytesExt;
+use snafu::ResultExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use value_log::Slice;
+
+use crate::{
+    format::{Codec, Entry, IndexEntry, InternalKey},
+    sst::err::{IOSnafu, Result},
+};
 
 /// Trait for types that can be stored in a block.
 ///
@@ -24,7 +38,7 @@ use crate::format::{Codec, Entry, IndexEntry, InternalKey};
 /// - Have a computable size for block size estimation
 pub trait BlockEntry: Codec + Clone + PartialEq {
     /// The type of key used for ordering entries in the block
-    type Key: Ord + Clone + std::fmt::Debug;
+    type Key: Ord + Clone + std::fmt::Debug + std::hash::Hash + Eq;
 
     /// Extract the key from this entry for ordering purposes
     fn key(&self) -> &Self::Key;
@@ -48,7 +62,140 @@ impl BlockEntry for IndexEntry {
 
     fn key(&self) -> &Self::Key { &self.key }
 
-    fn size(&self) -> u64 { self.size() }
+    /// Returns the serialized size of this IndexEntry in bytes.
+    /// This includes:
+    /// - The serialized size of the key
+    /// - 8 bytes for block_offset (u64)
+    /// - 8 bytes for block_size (u64)
+    fn size(&self) -> u64 { self.key.size() + 8 + 8 }
+}
+
+/// A lazy-loading entry that holds only the key until data is explicitly
+/// requested.
+///
+/// This struct allows for memory-efficient handling of entries by storing only
+/// the key and the information needed to read the full entry data when
+/// required. The actual entry data is loaded on-demand through the reader.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct IOEntry<R: std::io::Read + std::io::Seek> {
+    /// The key of this entry, available immediately without I/O
+    key:          InternalKey,
+    /// Reader positioned at the start of this entry's data
+    reader:       R,
+    /// Byte offset where this entry's data begins in the reader
+    offset:       u64,
+    /// Cached entry data, loaded on first access
+    cached_entry: Option<Entry>,
+}
+
+impl<R: std::io::Read + std::io::Seek> IOEntry<R> {
+    /// Creates a new IOEntry by reading the key from the reader at the given
+    /// offset.
+    ///
+    /// # Parameters
+    /// * `reader` - Reader that can seek to and read the entry's data
+    /// * `offset` - Byte offset where this entry's data begins
+    pub(crate) fn new(mut reader: R, offset: u64) -> std::io::Result<Self> {
+        // Seek to the entry's position
+        reader.seek(SeekFrom::Start(offset))?;
+        // Parse the key from the entry data
+        let key = InternalKey::decode_from(&mut reader)?;
+
+        // Reset reader position for later use
+        reader.seek(SeekFrom::Start(offset))?;
+
+        Ok(Self {
+            key,
+            reader,
+            offset,
+            cached_entry: None,
+        })
+    }
+
+    /// Loads and returns the full entry data, performing I/O if not already
+    /// cached.
+    ///
+    /// This method will seek to the entry's position and decode the data on
+    /// first call, then cache the result for subsequent calls.
+    pub(crate) fn entry(&mut self) -> std::io::Result<&Entry> {
+        if self.cached_entry.is_none() {
+            // Seek to the entry's position
+            self.reader.seek(SeekFrom::Start(self.offset))?;
+
+            // Decode the entry from the reader
+            let entry = Entry::decode_from(&mut self.reader)?;
+            self.cached_entry = Some(entry);
+        }
+
+        // Return the cached entry (safe to unwrap since we just ensured it exists)
+        Ok(self.cached_entry.as_ref().unwrap())
+    }
+}
+
+/// An async version of IOEntry that works with any async reader.
+///
+/// This struct stores the exact offset of the entry data, allowing direct
+/// seeking to the entry without rebuilding block readers.
+#[derive(PartialEq, Eq)]
+pub(crate) struct AsyncIOEntry<R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin> {
+    /// The key of this entry
+    key:          InternalKey,
+    /// Shared async reader
+    reader:       R,
+    /// Exact byte offset where this entry's data starts in the reader
+    entry_offset: u64,
+    /// Cached entry data, loaded on first access
+    cached_entry: Option<Entry>,
+}
+
+impl<R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin> Hash for AsyncIOEntry<R> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) { self.key.hash(state); }
+}
+
+impl<R> AsyncIOEntry<R>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    /// Creates a new AsyncIOEntry with the exact entry offset.
+    ///
+    /// # Parameters
+    /// * `reader` - Async reader that can seek to and read the entry's data
+    /// * `entry_offset` - Exact byte offset where this entry's data starts
+    pub(crate) async fn new(mut reader: R, entry_offset: u64) -> Result<Self> {
+        reader
+            .seek(SeekFrom::Start(entry_offset))
+            .await
+            .context(IOSnafu)?;
+        let key = InternalKey::async_decode_from(&mut reader)
+            .await
+            .context(IOSnafu)?;
+        Ok(Self {
+            key,
+            reader,
+            entry_offset,
+            cached_entry: None,
+        })
+    }
+
+    /// Loads and returns the full entry data, performing async I/O if not
+    /// already cached.
+    ///
+    /// This method seeks directly to the entry's offset and decodes it,
+    /// without needing to rebuild block readers.
+    pub(crate) async fn entry(&mut self) -> std::io::Result<&Entry> {
+        if self.cached_entry.is_none() {
+            // Seek directly to the entry's offset
+            self.reader
+                .seek(std::io::SeekFrom::Start(self.entry_offset))
+                .await?;
+
+            // Decode the entry directly from the reader
+            let entry = Entry::async_decode_from(&mut self.reader).await?;
+            self.cached_entry = Some(entry);
+        }
+
+        Ok(self.cached_entry.as_ref().unwrap())
+    }
 }
 
 /// A generic block builder that can build blocks for different entry types.
@@ -221,31 +368,51 @@ pub(crate) type DataBlockBuilder = BlockBuilder<Entry>;
 pub(crate) type IndexBlockBuilder = BlockBuilder<IndexEntry>;
 
 /// A reader for reading a block from a reader.
-pub(crate) struct BlockReader<T: BlockEntry, R: std::io::Read> {
+pub(crate) struct BlockReader<T: BlockEntry, R> {
+    /// The reader for the block
     reader:  R,
+    /// The offsets for each entry in the block
     offsets: Vec<u64>,
+    /// The number of entries in the block, used for iteration
     count:   u32,
     _marker: std::marker::PhantomData<T>,
 }
 
+impl<T: BlockEntry, R> Clone for BlockReader<T, R>
+where
+    R: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            reader:  self.reader.clone(),
+            offsets: self.offsets.clone(),
+            count:   self.count,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<T: BlockEntry, R: std::io::Read + std::io::Seek> BlockReader<T, R> {
-    pub(crate) fn new(mut reader: R) -> std::io::Result<Self> {
+    pub(crate) fn new(mut reader: R) -> Result<Self> {
         // Try to read from the end to get the entry count
         let mut buf = [0; 4];
-        reader.seek(SeekFrom::End(-4))?;
-        reader.read_exact(&mut buf)?;
+        reader.seek(SeekFrom::End(-4)).context(IOSnafu)?;
+        reader.read_exact(&mut buf).context(IOSnafu)?;
 
+        // how many entry in this block.
         let count = u32::from_le_bytes(buf);
+        // the offset section size is the number of entries * the size of each offset.
         let offset_section_size = count as usize * std::mem::size_of::<u64>();
         let mut offset_buf = vec![0; offset_section_size];
-        // Read offset table from the position before the entry count
-        reader.seek(SeekFrom::End(-4 - offset_section_size as i64))?;
-        reader.read_exact(&mut offset_buf)?;
-        let offsets = offset_buf
+        // Read offset table from the position before the entry count.
+        reader
+            .seek(SeekFrom::End(-4 - offset_section_size as i64))
+            .context(IOSnafu)?;
+        reader.read_exact(&mut offset_buf).context(IOSnafu)?;
+        let offsets: Vec<u64> = offset_buf
             .chunks_exact(std::mem::size_of::<u64>())
             .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-
         Ok(Self {
             reader,
             offsets,
@@ -270,6 +437,72 @@ impl<T: BlockEntry, R: std::io::Read + std::io::Seek> BlockReader<T, R> {
 
     /// Returns true if the block is empty.
     pub(crate) fn is_empty(&self) -> bool { self.count == 0 }
+
+    /// Performs a point lookup for a specific key within this block.
+    ///
+    /// Searches through entries sequentially until the key is found or we
+    /// determine it doesn't exist. Since entries are sorted by key, we can
+    /// stop early if we encounter a key greater than our target.
+    ///
+    /// # Parameters
+    /// * `target_key` - The key to search for
+    ///
+    /// # Returns
+    /// * `Ok(Some(entry))` - If the key is found
+    /// * `Ok(None)` - If the key is not found in this block
+    /// * `Err(...)` - If there's an I/O error while reading
+    pub(crate) fn get(&mut self, target_key: &T::Key) -> std::io::Result<Option<T>> {
+        // Search through all entries sequentially
+        for index in 0..self.count as usize {
+            let offset = self.offsets[index];
+            self.reader.seek(SeekFrom::Start(offset))?;
+
+            // Decode the entry to check its key
+            let entry = T::decode_from(&mut self.reader)?;
+
+            match entry.key().cmp(target_key) {
+                std::cmp::Ordering::Equal => return Ok(Some(entry)),
+                std::cmp::Ordering::Greater => {
+                    // Since entries are sorted, we won't find the target key
+                    // in the remaining entries
+                    return Ok(None);
+                }
+                std::cmp::Ordering::Less => {
+                    // Continue searching
+                    continue;
+                }
+            }
+        }
+
+        // Key not found after checking all entries
+        Ok(None)
+    }
+
+    /// Gets an entry at a specific index within this block.
+    ///
+    /// This is useful when you know the exact position of the entry you want.
+    /// Returns None if the index is out of bounds.
+    ///
+    /// # Parameters
+    /// * `index` - Zero-based index of the entry to retrieve
+    ///
+    /// # Returns
+    /// * `Ok(Some(entry))` - If the index is valid
+    /// * `Ok(None)` - If the index is out of bounds
+    /// * `Err(...)` - If there's an I/O error while reading
+    pub(crate) fn get_at_index(&mut self, index: usize) -> std::io::Result<Option<T>> {
+        if index >= self.count as usize {
+            return Ok(None);
+        }
+
+        // Seek to the entry at the specified index
+        let offset = self.offsets[index];
+        self.reader.seek(SeekFrom::Start(offset))?;
+
+        // Decode and return the entry
+        let entry = T::decode_from(&mut self.reader)?;
+        Ok(Some(entry))
+    }
 }
 
 /// Type alias for backward compatibility with existing data block usage
@@ -564,9 +797,9 @@ mod tests {
 
         // Verify we can read back the data
         let cursor = Cursor::new(vec_buffer);
-        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
+        let mut reader = DataBlockReader::new(cursor).expect("Failed to create reader");
 
-        let read_values: Result<Vec<_>, _> = reader.iter().collect();
+        let read_values: std::result::Result<Vec<_>, std::io::Error> = reader.iter().collect();
         let read_values = read_values.expect("Failed to read values");
 
         assert_eq!(read_values.len(), values.len());
@@ -598,14 +831,14 @@ mod tests {
 
         // Create reader from the bytes
         let cursor = Cursor::new(block_bytes);
-        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
+        let mut reader = DataBlockReader::new(cursor).expect("Failed to create reader");
 
         // Verify reader properties
         assert_eq!(reader.len(), values.len());
         assert!(!reader.is_empty());
 
         // Read back all values using iterator
-        let read_values: Result<Vec<_>, _> = reader.iter().collect();
+        let read_values: std::result::Result<Vec<_>, std::io::Error> = reader.iter().collect();
         let read_values = read_values.expect("Failed to read values");
 
         // Verify all values match
@@ -661,8 +894,7 @@ mod tests {
             builder.finish();
             let block_bytes = builder.build().expect("Failed to build block");
             let cursor = Cursor::new(block_bytes);
-            let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
-
+            let mut reader = DataBlockReader::new(cursor).expect("Failed to create reader");
             let mut iter = reader.iter();
 
             // Test size hint at start
@@ -683,7 +915,7 @@ mod tests {
             block_bytes.extend_from_slice(&0u32.to_le_bytes());
 
             let cursor = Cursor::new(block_bytes);
-            let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
+            let mut reader = DataBlockReader::new(cursor).expect("Failed to create reader");
             let iter = reader.iter();
 
             assert_eq!(iter.size_hint(), (0, Some(0)));
@@ -698,7 +930,7 @@ mod tests {
         block_bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 entries
 
         let cursor = Cursor::new(block_bytes);
-        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
+        let mut reader = DataBlockReader::new(cursor).expect("Failed to create reader");
 
         assert_eq!(reader.len(), 0);
         assert!(reader.is_empty());
@@ -737,9 +969,9 @@ mod tests {
         let block_bytes = builder.build().expect("Failed to build block");
 
         let cursor = Cursor::new(block_bytes);
-        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
+        let mut reader = DataBlockReader::new(cursor).expect("Failed to create reader");
 
-        let values: Result<Vec<_>, _> = reader.iter().collect();
+        let values: std::result::Result<Vec<_>, std::io::Error> = reader.iter().collect();
         let values = values.expect("Failed to read values");
 
         assert_eq!(values.len(), is_tombstone_pattern.len());
@@ -772,7 +1004,7 @@ mod tests {
         let block_bytes = builder.build().expect("Failed to build block");
 
         let cursor = Cursor::new(block_bytes);
-        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
+        let mut reader = DataBlockReader::new(cursor).expect("Failed to create reader");
 
         assert_eq!(reader.len(), num_entries);
 
@@ -829,15 +1061,14 @@ mod tests {
 
         // Create reader from the bytes
         let cursor = Cursor::new(block_bytes);
-        let mut reader =
-            BlockReader::<IndexEntry, _>::new(cursor).expect("Failed to create reader");
+        let mut reader = IndexBlockReader::new(cursor).expect("Failed to create reader");
 
         // Verify reader properties
         assert_eq!(reader.len(), index_entries.len());
         assert!(!reader.is_empty());
 
         // Read back all entries using iterator
-        let read_entries: Result<Vec<_>, _> = reader.iter().collect();
+        let read_entries: std::result::Result<Vec<_>, std::io::Error> = reader.iter().collect();
         let read_entries = read_entries.expect("Failed to read index entries");
 
         // Verify all entries match
@@ -877,5 +1108,169 @@ mod tests {
         // Both should be able to build successfully
         assert!(data_builder.build().is_ok());
         assert!(index_builder.build().is_ok());
+    }
+
+    #[test]
+    fn test_block_reader_get() {
+        let mut builder = BlockBuilder::<Entry>::new();
+
+        // Add test entries in sorted order
+        let entries = vec![
+            create_test_value("apple", 100, 5, "fruit"),
+            create_test_value("banana", 200, 4, "yellow"),
+            create_test_value("cherry", 150, 3, "red"),
+            create_test_value("date", 300, 2, "sweet"),
+            create_test_value("elderberry", 250, 1, "purple"),
+        ];
+
+        for entry in &entries {
+            builder.add(entry.clone());
+        }
+        builder.finish();
+
+        let block_bytes = builder.build().expect("Failed to build block");
+        let cursor = Cursor::new(block_bytes);
+        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
+
+        // Test finding existing keys
+        for entry in &entries {
+            let found = reader.get(&entry.key).expect("Failed to search for key");
+            assert!(found.is_some(), "Should find key: {:?}", entry.key);
+            let found_entry = found.unwrap();
+            assert_eq!(found_entry.key, entry.key);
+            assert_eq!(found_entry.value, entry.value);
+        }
+
+        // Test key that doesn't exist but is within range
+        let missing_key = create_test_value("grape", 200, 3, "missing").key;
+        let found = reader
+            .get(&missing_key)
+            .expect("Failed to search for missing key");
+        assert!(found.is_none(), "Should not find missing key");
+
+        // Test key that's before all entries
+        let before_key = create_test_value("aardvark", 100, 1, "before").key;
+        let found = reader
+            .get(&before_key)
+            .expect("Failed to search for before key");
+        assert!(found.is_none(), "Should not find key before range");
+
+        // Test key that's after all entries
+        let after_key = create_test_value("zebra", 100, 1, "after").key;
+        let found = reader
+            .get(&after_key)
+            .expect("Failed to search for after key");
+        assert!(found.is_none(), "Should not find key after range");
+    }
+
+    #[test]
+    fn test_block_reader_get_at_index() {
+        let mut builder = BlockBuilder::<Entry>::new();
+
+        // Add test entries
+        let entries = vec![
+            create_test_value("key1", 100, 3, "value1"),
+            create_test_value("key2", 200, 2, "value2"),
+            create_test_value("key3", 300, 1, "value3"),
+        ];
+
+        for entry in &entries {
+            builder.add(entry.clone());
+        }
+        builder.finish();
+
+        let block_bytes = builder.build().expect("Failed to build block");
+        let cursor = Cursor::new(block_bytes);
+        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
+
+        // Test getting entries by index
+        for (i, expected_entry) in entries.iter().enumerate() {
+            let found = reader
+                .get_at_index(i)
+                .expect("Failed to get entry at index");
+            assert!(found.is_some(), "Should find entry at index {}", i);
+            let found_entry = found.unwrap();
+            assert_eq!(found_entry.key, expected_entry.key);
+            assert_eq!(found_entry.value, expected_entry.value);
+        }
+
+        // Test out of bounds index
+        let found = reader
+            .get_at_index(entries.len())
+            .expect("Failed to check out of bounds");
+        assert!(
+            found.is_none(),
+            "Should not find entry at out of bounds index"
+        );
+    }
+
+    #[test]
+    fn test_block_reader_get_empty_block() {
+        // Create an empty block (just entry count = 0)
+        let mut block_bytes = Vec::new();
+        block_bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let cursor = Cursor::new(block_bytes);
+        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
+
+        // Test searching in empty block
+        let test_key = create_test_value("test", 100, 1, "value").key;
+        let found = reader
+            .get(&test_key)
+            .expect("Failed to search in empty block");
+        assert!(found.is_none(), "Should not find anything in empty block");
+
+        // Test get_at_index in empty block
+        let found = reader
+            .get_at_index(0)
+            .expect("Failed to get at index in empty block");
+        assert!(
+            found.is_none(),
+            "Should not find anything at index 0 in empty block"
+        );
+    }
+
+    #[test_case(1; "single entry")]
+    #[test_case(2; "two entries")]
+    #[test_case(5; "small block")]
+    #[test_case(10; "medium block")]
+    #[test_case(100; "large block")]
+    fn test_block_reader_get_stress(num_entries: usize) {
+        let mut builder = BlockBuilder::<Entry>::new();
+
+        // Create entries with predictable keys
+        let mut entries = Vec::new();
+        for i in 0..num_entries {
+            let key = format!("key{:06}", i);
+            let value = format!("value{}", i);
+            let entry = create_test_value(&key, 100, i as u64, &value);
+            entries.push(entry.clone());
+            builder.add(entry);
+        }
+        builder.finish();
+
+        let block_bytes = builder.build().expect("Failed to build block");
+        let cursor = Cursor::new(block_bytes);
+        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
+
+        // Test finding all entries
+        for entry in &entries {
+            let found = reader.get(&entry.key).expect("Failed to search for key");
+            assert!(found.is_some(), "Should find key: {:?}", entry.key);
+            let found_entry = found.unwrap();
+            assert_eq!(found_entry.key, entry.key);
+            assert_eq!(found_entry.value, entry.value);
+        }
+
+        // Test get_at_index for all entries
+        for (i, expected_entry) in entries.iter().enumerate() {
+            let found = reader
+                .get_at_index(i)
+                .expect("Failed to get entry at index");
+            assert!(found.is_some(), "Should find entry at index {}", i);
+            let found_entry = found.unwrap();
+            assert_eq!(found_entry.key, expected_entry.key);
+            assert_eq!(found_entry.value, expected_entry.value);
+        }
     }
 }

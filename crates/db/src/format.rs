@@ -15,6 +15,7 @@
 use std::io::{Read, Write};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use tokio::io::AsyncRead;
 use value_log::Slice;
 
 pub(crate) const MANIFEST_FILE: &str = "manifest";
@@ -41,7 +42,7 @@ pub trait Codec {
 pub type SeqNo = u64;
 pub type Timestamp = u64;
 
-#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, bon::Builder)]
 pub struct UserKey {
     #[builder(into)]
     pub key:       Slice,
@@ -63,7 +64,7 @@ impl PartialOrd for UserKey {
 }
 
 /// Value type (regular value or tombstone)
-#[derive(Clone, PartialEq, Eq, bon::Builder)]
+#[derive(Clone, PartialEq, Eq, Hash, bon::Builder)]
 pub struct InternalKey {
     #[builder(into)]
     pub user_key:   UserKey,
@@ -161,9 +162,29 @@ impl InternalKey {
             value_type,
         }
     }
+
+    pub async fn async_decode_from<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Self> {
+        use tokio::io::AsyncReadExt;
+
+        let seqno = reader.read_u64_le().await?;
+        let value_type = ValueType::from(reader.read_u8().await?);
+        let timestamp = reader.read_u64_le().await?;
+        let key_len = reader.read_u64_le().await?;
+        let mut key = vec![0; key_len as usize];
+        reader.read_exact(&mut key).await?;
+
+        Ok(Self {
+            user_key: UserKey {
+                key: Slice::from(key),
+                timestamp,
+            },
+            seqno,
+            value_type,
+        })
+    }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
 pub enum ValueType {
     /// Existing value
@@ -219,6 +240,22 @@ impl Entry {
             ),
             value: value.into(),
         }
+    }
+
+    pub(crate) async fn async_decode_from<R: AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> std::io::Result<Self> {
+        use tokio::io::AsyncReadExt;
+
+        let key = InternalKey::async_decode_from(reader).await?;
+        let value_len = reader.read_u64_le().await?;
+        let mut value = vec![0; value_len as usize];
+        reader.read_exact(&mut value).await?;
+
+        Ok(Self {
+            key,
+            value: Slice::from(value),
+        })
     }
 }
 
@@ -279,13 +316,6 @@ impl IndexEntry {
             block_size,
         }
     }
-
-    /// Returns the serialized size of this IndexEntry in bytes.
-    /// This includes:
-    /// - The serialized size of the key
-    /// - 8 bytes for block_offset (u64)
-    /// - 8 bytes for block_size (u64)
-    pub fn size(&self) -> u64 { self.key.size() + 8 + 8 }
 }
 
 impl Codec for IndexEntry {
