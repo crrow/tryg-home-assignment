@@ -23,6 +23,7 @@ strum_macros.workspace = true
 test-case.workspace = true
 tracing.workspace = true
 value-log = "^1.9.0"
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3.8"

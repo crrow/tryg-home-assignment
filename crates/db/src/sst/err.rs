@@ -12,9 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use snafu::Snafu;
+use snafu::{Location, Snafu};
 
 #[derive(Debug, Snafu)]
-pub(crate) enum Error {}
+#[snafu(visibility(pub(crate)))]
+pub(crate) enum Error {
+    IOError {
+        source:   std::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    InvalidSSTFile {
+        path:     String,
+        reason:   String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    IndexChecksumMismatch {
+        expected: u32,
+        actual:   u32,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    BlockBuildError {
+        message:  String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    EntryIndexOutOfBounds {
+        index:    usize,
+        max:      usize,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    IncompleteEntryData {
+        #[snafu(implicit)]
+        location: Location,
+    },
+}
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
