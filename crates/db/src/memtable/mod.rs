@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bon::{Builder, builder};
 use crossbeam_skiplist::SkipMap;
 
-use crate::format::{InternalKey, InternalValue, SeqNo, Timestamp, UserKey, UserValue};
+use crate::format::{Entry, InternalKey, SeqNo, Timestamp, UserKey, UserValue};
 
 #[derive(Debug, Builder)]
 pub(crate) struct MemTable {
@@ -40,7 +40,7 @@ impl MemTable {
     /// Appends a data point to the memtable.
     ///
     /// Returns the new size of the memtable.
-    pub(crate) fn insert(&self, item: InternalValue) -> u64 {
+    pub(crate) fn insert(&self, item: Entry) -> u64 {
         let item_size = item.size();
         let size_before = self.approximate_size.fetch_add(item_size, Ordering::AcqRel);
 
@@ -51,8 +51,8 @@ impl MemTable {
     }
 
     /// Creates an iterator over all items.
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = InternalValue> + '_ {
-        self.items.iter().map(|entry| InternalValue {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = Entry> + '_ {
+        self.items.iter().map(|entry| Entry {
             key:   entry.key().clone(),
             value: entry.value().clone(),
         })
@@ -60,7 +60,7 @@ impl MemTable {
 
     /// Returns the most recent value for the given key and timestamp, not
     /// exceeding the given seqno (if provided).
-    pub(crate) fn get(&self, key: &[u8], ts: Timestamp, seqno: SeqNo) -> Option<InternalValue> {
+    pub(crate) fn get(&self, key: &[u8], ts: Timestamp, seqno: SeqNo) -> Option<Entry> {
         // We want the latest value for (key, ts) <= given ts, and seqno <= given seqno.
         // Instead of trying to construct a precise search key, we'll search for all
         // entries with the given key and filter by timestamp and seqno
@@ -83,7 +83,7 @@ impl MemTable {
         // Get all entries for this key
         let iter = self.items.range(start_key..=end_key);
 
-        let mut best_match: Option<InternalValue> = None;
+        let mut best_match: Option<Entry> = None;
 
         for entry in iter {
             let found_key = entry.key();
@@ -112,7 +112,7 @@ impl MemTable {
                     };
 
                     if is_better {
-                        best_match = Some(InternalValue {
+                        best_match = Some(Entry {
                             key:   found_key.clone(),
                             value: entry.value().clone(),
                         });
@@ -201,7 +201,7 @@ mod tests {
         for (k, v, ts, seq) in &inserts {
             let key = k.as_bytes();
             let value = v.as_bytes();
-            let internal_value = InternalValue::make(key, *ts, *seq, value);
+            let internal_value = Entry::make(key, *ts, *seq, value);
             memtable.insert(internal_value);
         }
 
@@ -229,19 +229,19 @@ mod tests {
 
         // Insert multiple versions of the same key with different timestamps and
         // seqnos. Entry 1: ts=100, seqno=1
-        let entry1 = InternalValue::make(key, 100, 1, "value_at_100_seq1".as_bytes());
+        let entry1 = Entry::make(key, 100, 1, "value_at_100_seq1".as_bytes());
         memtable.insert(entry1);
 
         // Entry 2: ts=200, seqno=2
-        let entry2 = InternalValue::make(key, 200, 2, "value_at_200_seq2".as_bytes());
+        let entry2 = Entry::make(key, 200, 2, "value_at_200_seq2".as_bytes());
         memtable.insert(entry2);
 
         // Entry 3: ts=150, seqno=3 (newer seqno but older timestamp than entry2)
-        let entry3 = InternalValue::make(key, 150, 3, "value_at_150_seq3".as_bytes());
+        let entry3 = Entry::make(key, 150, 3, "value_at_150_seq3".as_bytes());
         memtable.insert(entry3);
 
         // Entry 4: ts=200, seqno=4 (same timestamp as entry2 but newer seqno)
-        let entry4 = InternalValue::make(key, 200, 4, "value_at_200_seq4".as_bytes());
+        let entry4 = Entry::make(key, 200, 4, "value_at_200_seq4".as_bytes());
         memtable.insert(entry4);
 
         memtable

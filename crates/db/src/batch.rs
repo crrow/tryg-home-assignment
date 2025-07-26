@@ -16,9 +16,7 @@ use std::io::{Read, Write};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
-use crate::format::{
-    Codec, InternalKey, InternalValue, SeqNo, Timestamp, UserKey, UserValue, ValueType,
-};
+use crate::format::{Codec, Entry, InternalKey, SeqNo, Timestamp, UserKey, UserValue, ValueType};
 
 /// `WriteBatch` holds a collection of InternalValue updates to apply atomically
 /// to a DB.
@@ -43,7 +41,7 @@ pub struct WriteBatch {
     /// Starting sequence number for this batch
     sequence: SeqNo,
     /// List of InternalValue operations in this batch
-    values:   Vec<InternalValue>,
+    values:   Vec<Entry>,
 }
 
 pub const HEADER_SIZE: usize = 12; // 8 bytes seq + 4 bytes count
@@ -70,7 +68,7 @@ impl WriteBatch {
             value_type: ValueType::Value,
         };
 
-        let internal_value = InternalValue {
+        let internal_value = Entry {
             key:   internal_key,
             value: value.into(),
         };
@@ -91,7 +89,7 @@ impl WriteBatch {
             value_type: ValueType::Tombstone,
         };
 
-        let internal_value = InternalValue {
+        let internal_value = Entry {
             key:   internal_key,
             value: UserValue::from(""), // Empty value for tombstones
         };
@@ -119,7 +117,7 @@ impl WriteBatch {
         size
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &InternalValue> { self.values.iter() }
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Entry> { self.values.iter() }
 
     pub(crate) fn encode_header(&self) -> std::io::Result<Vec<u8>> {
         // Pre-allocate buffer with the expected header size for efficiency.
@@ -155,7 +153,7 @@ impl Codec for WriteBatch {
 
         // Read each InternalValue
         for _ in 0..count {
-            let value = InternalValue::decode_from(reader)?;
+            let value = Entry::decode_from(reader)?;
             values.push(value);
         }
 

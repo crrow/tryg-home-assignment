@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod block;
-pub(crate) mod err;
-pub(crate) mod table;
+use snafu::Snafu;
+
+#[derive(Debug, Snafu)]
+pub(crate) enum Error {}
+
+pub(crate) type Result<T> = std::result::Result<T, Error>;

@@ -14,9 +14,44 @@
 
 use std::io::{SeekFrom, Write};
 
-use crate::format::{Codec, InternalKey, InternalValue};
+use crate::format::{Codec, Entry, IndexEntry, InternalKey};
 
-/// A block builder is used to build a block in SSTable format.
+/// Trait for types that can be stored in a block.
+///
+/// Block entries must be:
+/// - Serializable via the Codec trait
+/// - Have a key that can be extracted for ordering
+/// - Have a computable size for block size estimation
+pub trait BlockEntry: Codec + Clone + PartialEq {
+    /// The type of key used for ordering entries in the block
+    type Key: Ord + Clone + std::fmt::Debug;
+
+    /// Extract the key from this entry for ordering purposes
+    fn key(&self) -> &Self::Key;
+
+    /// Return the serialized size of this entry in bytes
+    fn size(&self) -> u64;
+}
+
+/// Implementation of BlockEntry for the existing Entry type (data blocks)
+impl BlockEntry for Entry {
+    type Key = InternalKey;
+
+    fn key(&self) -> &Self::Key { &self.key }
+
+    fn size(&self) -> u64 { self.size() }
+}
+
+/// Implementation of BlockEntry for IndexEntry type (index blocks)
+impl BlockEntry for IndexEntry {
+    type Key = InternalKey;
+
+    fn key(&self) -> &Self::Key { &self.key }
+
+    fn size(&self) -> u64 { self.size() }
+}
+
+/// A generic block builder that can build blocks for different entry types.
 ///
 /// ## Block Layout
 ///
@@ -31,21 +66,21 @@ use crate::format::{Codec, InternalKey, InternalValue};
 /// The block builder accumulates entries and their offsets, then can be
 /// finished to produce the final block bytes.
 #[derive(Debug, Clone)]
-pub(crate) struct BlockBuilder {
-    /// The internal values stored in this block
-    items:          Vec<InternalValue>,
+pub(crate) struct BlockBuilder<T: BlockEntry> {
+    /// The entries stored in this block
+    items:          Vec<T>,
     /// Byte offsets for each item in the data section
     offsets:        Vec<u64>,
     /// Current offset in the data section
     current_offset: u64,
     /// The last key in the block
-    last_key:       Option<InternalKey>,
+    last_key:       Option<T::Key>,
     /// Whether this builder has been finished and can no longer accept new
     /// items
     finished:       bool,
 }
 
-impl BlockBuilder {
+impl<T: BlockEntry> BlockBuilder<T> {
     /// Creates a new empty block builder.
     pub(crate) fn new() -> Self {
         Self {
@@ -57,26 +92,31 @@ impl BlockBuilder {
         }
     }
 
-    /// Adds a new internal value to the block.
+    /// Adds a new entry to the block.
     ///
     /// Returns an error if the block builder has already been finished.
-    pub(crate) fn add(&mut self, value: InternalValue) {
+    ///
+    /// # Panics
+    ///
+    /// Panics if entries are not added in sorted order by key.
+    pub(crate) fn add(&mut self, entry: T) {
         assert!(!self.finished, "BlockBuilder should not be finished");
+
         // Ensure keys are added in sorted order
         if let Some(ref last_key) = self.last_key {
             assert!(
-                value.key > *last_key,
+                entry.key() > last_key,
                 "Keys must be added in sorted order: new key {:?} is not greater than last key \
                  {:?}",
-                value.key,
+                entry.key(),
                 last_key
             );
         }
 
         self.offsets.push(self.current_offset);
-        self.current_offset += value.size();
-        self.last_key = Some(value.key.clone());
-        self.items.push(value);
+        self.current_offset += entry.size();
+        self.last_key = Some(entry.key().clone());
+        self.items.push(entry);
     }
 
     /// Returns the current number of items in the block.
@@ -103,8 +143,6 @@ impl BlockBuilder {
     }
 
     /// Marks the block builder as finished, preventing further modifications.
-    ///
-    /// Returns an error if the block is empty.
     pub(crate) fn finish(&mut self) { self.finished = true; }
 
     /// Returns whether the block builder has been finished.
@@ -116,11 +154,12 @@ impl BlockBuilder {
         self.items.clear();
         self.offsets.clear();
         self.current_offset = 0;
+        self.last_key = None;
         self.finished = false;
     }
 
     /// Returns an iterator over the items in the block.
-    pub(crate) fn items(&self) -> impl Iterator<Item = &InternalValue> { self.items.iter() }
+    pub(crate) fn items(&self) -> impl Iterator<Item = &T> { self.items.iter() }
 
     /// Returns a slice of the offsets for each item.
     pub(crate) fn offsets(&self) -> &[u64] { &self.offsets }
@@ -128,7 +167,7 @@ impl BlockBuilder {
     /// Writes the block to the provided writer.
     ///
     /// The block format is:
-    /// - Data section: serialized InternalValues
+    /// - Data section: serialized entries using their Codec implementation
     /// - Offset section: u64 offsets for each entry (little-endian)
     /// - Entry count: u32 number of entries (little-endian)
     ///
@@ -148,7 +187,7 @@ impl BlockBuilder {
             ));
         }
 
-        // Write data section - serialize each InternalValue
+        // Write data section - serialize each entry using its Codec implementation
         for item in &self.items {
             item.encode_into(writer)?;
         }
@@ -175,14 +214,21 @@ impl BlockBuilder {
     }
 }
 
+/// Type alias for backward compatibility with existing data block usage
+pub(crate) type DataBlockBuilder = BlockBuilder<Entry>;
+
+/// Type alias for index block builder
+pub(crate) type IndexBlockBuilder = BlockBuilder<IndexEntry>;
+
 /// A reader for reading a block from a reader.
-pub(crate) struct BlockReader<R: std::io::Read> {
+pub(crate) struct BlockReader<T: BlockEntry, R: std::io::Read> {
     reader:  R,
     offsets: Vec<u64>,
     count:   u32,
+    _marker: std::marker::PhantomData<T>,
 }
 
-impl<R: std::io::Read + std::io::Seek> BlockReader<R> {
+impl<T: BlockEntry, R: std::io::Read + std::io::Seek> BlockReader<T, R> {
     pub(crate) fn new(mut reader: R) -> std::io::Result<Self> {
         // Try to read from the end to get the entry count
         let mut buf = [0; 4];
@@ -204,16 +250,18 @@ impl<R: std::io::Read + std::io::Seek> BlockReader<R> {
             reader,
             offsets,
             count,
+            _marker: std::marker::PhantomData,
         })
     }
 
-    /// Returns an iterator over the InternalValues in this block.
-    pub(crate) fn iter(&mut self) -> BlockIterator<'_, R> {
+    /// Returns an iterator over the entries in this block.
+    pub(crate) fn iter(&mut self) -> BlockIterator<'_, T, R> {
         BlockIterator {
             reader:        &mut self.reader,
             offsets:       &self.offsets,
             current_index: 0,
             count:         self.count,
+            _marker:       std::marker::PhantomData,
         }
     }
 
@@ -224,16 +272,23 @@ impl<R: std::io::Read + std::io::Seek> BlockReader<R> {
     pub(crate) fn is_empty(&self) -> bool { self.count == 0 }
 }
 
+/// Type alias for backward compatibility with existing data block usage
+pub(crate) type DataBlockReader<R> = BlockReader<Entry, R>;
+
+/// Type alias for index block reader
+pub(crate) type IndexBlockReader<R> = BlockReader<IndexEntry, R>;
+
 /// Iterator over the entries in a block.
-pub(crate) struct BlockIterator<'a, R: std::io::Read + std::io::Seek> {
+pub(crate) struct BlockIterator<'a, T: BlockEntry, R: std::io::Read + std::io::Seek> {
     reader:        &'a mut R,
     offsets:       &'a [u64],
     current_index: usize,
     count:         u32,
+    _marker:       std::marker::PhantomData<T>,
 }
 
-impl<'a, R: std::io::Read + std::io::Seek> Iterator for BlockIterator<'a, R> {
-    type Item = std::io::Result<InternalValue>;
+impl<'a, T: BlockEntry, R: std::io::Read + std::io::Seek> Iterator for BlockIterator<'a, T, R> {
+    type Item = std::io::Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_index >= self.count as usize {
@@ -247,11 +302,11 @@ impl<'a, R: std::io::Read + std::io::Seek> Iterator for BlockIterator<'a, R> {
             return Some(Err(e));
         }
 
-        // Decode the InternalValue from the reader
-        match InternalValue::decode_from(self.reader) {
-            Ok(value) => {
+        // Decode the entry from the reader using its Codec implementation
+        match T::decode_from(self.reader) {
+            Ok(entry) => {
                 self.current_index += 1;
-                Some(Ok(value))
+                Some(Ok(entry))
             }
             Err(e) => Some(Err(e)),
         }
@@ -263,7 +318,10 @@ impl<'a, R: std::io::Read + std::io::Seek> Iterator for BlockIterator<'a, R> {
     }
 }
 
-impl<'a, R: std::io::Read + std::io::Seek> ExactSizeIterator for BlockIterator<'a, R> {}
+impl<'a, T: BlockEntry, R: std::io::Read + std::io::Seek> ExactSizeIterator
+    for BlockIterator<'a, T, R>
+{
+}
 
 #[cfg(test)]
 mod tests {
@@ -272,7 +330,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::format::{InternalValue, UserKey, ValueType};
+    use crate::format::{Entry, UserKey, ValueType};
 
     /// A mock writer that counts bytes written without storing them
     struct CountingWriter {
@@ -295,13 +353,13 @@ mod tests {
     }
 
     /// Helper function to create test InternalValue
-    fn create_test_value(key: &str, timestamp: u64, seqno: u64, value: &str) -> InternalValue {
-        InternalValue::make(key, timestamp, seqno, value)
+    fn create_test_value(key: &str, timestamp: u64, seqno: u64, value: &str) -> Entry {
+        Entry::make(key, timestamp, seqno, value)
     }
 
     /// Helper function to create tombstone InternalValue
-    fn create_tombstone(key: &str, timestamp: u64, seqno: u64) -> InternalValue {
-        InternalValue {
+    fn create_tombstone(key: &str, timestamp: u64, seqno: u64) -> Entry {
+        Entry {
             key:   InternalKey::new(
                 UserKey::builder().key(key).timestamp(timestamp).build(),
                 seqno,
@@ -313,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_block_builder_new() {
-        let builder = BlockBuilder::new();
+        let builder = BlockBuilder::<Entry>::new();
         assert!(builder.is_empty());
         assert_eq!(builder.len(), 0);
         assert!(!builder.is_finished());
@@ -325,7 +383,7 @@ mod tests {
     #[test_case("very_long_key_name_that_tests_boundaries", 999999, 12345, "very_long_value_content_to_test_size_calculations"; "long strings")]
     #[test_case("特殊字符", 100, 1, "测试"; "unicode characters")]
     fn test_block_builder_add_single_item(key: &str, timestamp: u64, seqno: u64, value: &str) {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
         let test_value = create_test_value(key, timestamp, seqno, value);
 
         builder.add(test_value.clone());
@@ -341,7 +399,7 @@ mod tests {
 
     #[test]
     fn test_block_builder_add_multiple_items() {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
         let value1 = create_test_value("key1", 100, 3, "value1");
         let value2 = create_test_value("key2", 100, 2, "value2");
         let value3 = create_test_value("key3", 100, 1, "value3");
@@ -373,7 +431,7 @@ mod tests {
         first_seqno: u64,
         second_seqno: u64,
     ) {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
         let value1 = create_test_value(first_key, first_timestamp, first_seqno, "value1");
         let value2 = create_test_value(second_key, second_timestamp, second_seqno, "value2");
 
@@ -393,7 +451,7 @@ mod tests {
         first_seqno: u64,
         second_seqno: u64,
     ) {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
         let value1 = create_test_value(first_key, first_timestamp, first_seqno, "value1");
         let value2 = create_test_value(second_key, second_timestamp, second_seqno, "value2");
 
@@ -406,7 +464,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "BlockBuilder should not be finished")]
     fn test_block_builder_prevents_add_after_finish() {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
         let value = create_test_value("key1", 100, 1, "value1");
 
         builder.add(value.clone());
@@ -416,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_block_builder_estimate_size() {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
         let initial_size = builder.estimate_size();
 
         let value1 = create_test_value("key1", 100, 1, "value1");
@@ -428,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_block_builder_clear() {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
         let value = create_test_value("key1", 100, 1, "value1");
 
         builder.add(value);
@@ -445,7 +503,7 @@ mod tests {
     #[test_case(true, false; "empty finished block")]
     #[test_case(false, true; "unfinished block with data")]
     fn test_block_build_error_conditions(should_finish: bool, should_add_data: bool) {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
 
         if should_add_data {
             let value = create_test_value("key1", 100, 1, "value1");
@@ -472,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_build_into_different_writers() {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
 
         // Add test data
         let values = vec![
@@ -506,7 +564,7 @@ mod tests {
 
         // Verify we can read back the data
         let cursor = Cursor::new(vec_buffer);
-        let mut reader = BlockReader::new(cursor).expect("Failed to create reader");
+        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
 
         let read_values: Result<Vec<_>, _> = reader.iter().collect();
         let read_values = read_values.expect("Failed to read values");
@@ -519,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_block_builder_and_reader_roundtrip() {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
 
         // Add test data
         let values = vec![
@@ -540,7 +598,7 @@ mod tests {
 
         // Create reader from the bytes
         let cursor = Cursor::new(block_bytes);
-        let mut reader = BlockReader::new(cursor).expect("Failed to create reader");
+        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
 
         // Verify reader properties
         assert_eq!(reader.len(), values.len());
@@ -559,7 +617,7 @@ mod tests {
 
     #[test]
     fn test_build_into_memory_efficiency() {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
 
         // Add test data
         for i in 0..100 {
@@ -591,11 +649,11 @@ mod tests {
     #[test_case(5; "multiple item iterator")]
     #[test_case(100; "large iterator")]
     fn test_block_iterator_size_hint(num_items: usize) {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
 
         // Add test data
         for i in 0..num_items {
-            let value = create_test_value(&format!("key{i}"), 100, i as u64, "value");
+            let value = create_test_value(&format!("key{i:06}"), 100, i as u64, "value");
             builder.add(value);
         }
 
@@ -603,7 +661,7 @@ mod tests {
             builder.finish();
             let block_bytes = builder.build().expect("Failed to build block");
             let cursor = Cursor::new(block_bytes);
-            let mut reader = BlockReader::new(cursor).expect("Failed to create reader");
+            let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
 
             let mut iter = reader.iter();
 
@@ -625,7 +683,7 @@ mod tests {
             block_bytes.extend_from_slice(&0u32.to_le_bytes());
 
             let cursor = Cursor::new(block_bytes);
-            let mut reader = BlockReader::new(cursor).expect("Failed to create reader");
+            let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
             let iter = reader.iter();
 
             assert_eq!(iter.size_hint(), (0, Some(0)));
@@ -640,7 +698,7 @@ mod tests {
         block_bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 entries
 
         let cursor = Cursor::new(block_bytes);
-        let mut reader = BlockReader::new(cursor).expect("Failed to create reader");
+        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
 
         assert_eq!(reader.len(), 0);
         assert!(reader.is_empty());
@@ -655,7 +713,7 @@ mod tests {
     #[test_case(vec![true]; "single tombstone")]
     #[test_case(vec![false]; "single value")]
     fn test_block_with_mixed_entry_types(is_tombstone_pattern: Vec<bool>) {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
 
         // Create entries based on the pattern
         for (i, &is_tombstone) in is_tombstone_pattern.iter().enumerate() {
@@ -679,7 +737,7 @@ mod tests {
         let block_bytes = builder.build().expect("Failed to build block");
 
         let cursor = Cursor::new(block_bytes);
-        let mut reader = BlockReader::new(cursor).expect("Failed to create reader");
+        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
 
         let values: Result<Vec<_>, _> = reader.iter().collect();
         let values = values.expect("Failed to read values");
@@ -701,7 +759,7 @@ mod tests {
     #[test_case(100; "medium block")]
     #[test_case(1000; "large block")]
     fn test_block_with_varying_sizes(num_entries: usize) {
-        let mut builder = BlockBuilder::new();
+        let mut builder = BlockBuilder::<Entry>::new();
 
         // Add entries to test offset calculations
         for i in 0..num_entries {
@@ -714,12 +772,110 @@ mod tests {
         let block_bytes = builder.build().expect("Failed to build block");
 
         let cursor = Cursor::new(block_bytes);
-        let mut reader = BlockReader::new(cursor).expect("Failed to create reader");
+        let mut reader = BlockReader::<Entry, _>::new(cursor).expect("Failed to create reader");
 
         assert_eq!(reader.len(), num_entries);
 
         // Verify we can read all entries
         let count = reader.iter().count();
         assert_eq!(count, num_entries);
+    }
+
+    #[test]
+    fn test_index_block_builder_roundtrip() {
+        use crate::format::IndexEntry;
+
+        let mut builder = BlockBuilder::<IndexEntry>::new();
+
+        // Create test index entries
+        let index_entries = vec![
+            IndexEntry::new(
+                InternalKey::new(
+                    UserKey::builder().key("key1").timestamp(100).build(),
+                    3,
+                    ValueType::Value,
+                ),
+                0,
+                1024,
+            ),
+            IndexEntry::new(
+                InternalKey::new(
+                    UserKey::builder().key("key2").timestamp(200).build(),
+                    2,
+                    ValueType::Value,
+                ),
+                1024,
+                2048,
+            ),
+            IndexEntry::new(
+                InternalKey::new(
+                    UserKey::builder().key("key3").timestamp(300).build(),
+                    1,
+                    ValueType::Value,
+                ),
+                3072,
+                1536,
+            ),
+        ];
+
+        // Add entries to the index block
+        for entry in &index_entries {
+            builder.add(entry.clone());
+        }
+        builder.finish();
+
+        // Build the block
+        let block_bytes = builder.build().expect("Failed to build index block");
+
+        // Create reader from the bytes
+        let cursor = Cursor::new(block_bytes);
+        let mut reader =
+            BlockReader::<IndexEntry, _>::new(cursor).expect("Failed to create reader");
+
+        // Verify reader properties
+        assert_eq!(reader.len(), index_entries.len());
+        assert!(!reader.is_empty());
+
+        // Read back all entries using iterator
+        let read_entries: Result<Vec<_>, _> = reader.iter().collect();
+        let read_entries = read_entries.expect("Failed to read index entries");
+
+        // Verify all entries match
+        assert_eq!(read_entries.len(), index_entries.len());
+        for (original, read) in index_entries.iter().zip(read_entries.iter()) {
+            assert_eq!(original, read);
+            // Verify the specific fields
+            assert_eq!(original.key, read.key);
+            assert_eq!(original.block_offset, read.block_offset);
+            assert_eq!(original.block_size, read.block_size);
+        }
+    }
+
+    #[test]
+    fn test_type_aliases_work() {
+        use crate::format::IndexEntry;
+
+        // Test that our type aliases work correctly
+        let mut data_builder = DataBlockBuilder::new();
+        let data_entry = create_test_value("key1", 100, 1, "value1");
+        data_builder.add(data_entry.clone());
+        data_builder.finish();
+
+        let mut index_builder = IndexBlockBuilder::new();
+        let index_entry = IndexEntry::new(
+            InternalKey::new(
+                UserKey::builder().key("key1").timestamp(100).build(),
+                1,
+                ValueType::Value,
+            ),
+            0,
+            1024,
+        );
+        index_builder.add(index_entry.clone());
+        index_builder.finish();
+
+        // Both should be able to build successfully
+        assert!(data_builder.build().is_ok());
+        assert!(index_builder.build().is_ok());
     }
 }

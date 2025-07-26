@@ -27,7 +27,7 @@ use rsketch_common::readable_size::ReadableSize;
 
 use crate::{
     batch::WriteBatch,
-    format::{Codec, InternalValue},
+    format::{Codec, Entry},
     memtable::{MemTable, immut::ImmutableMemTables},
 };
 
@@ -94,7 +94,7 @@ impl MemManager {
         Ok(())
     }
 
-    fn apply_internal_values(&self, internal_values: &[InternalValue]) -> std::io::Result<bool> {
+    fn apply_internal_values(&self, internal_values: &[Entry]) -> std::io::Result<bool> {
         let memtable_guard = self
             .memtable
             .write()
@@ -204,7 +204,7 @@ impl MemManager {
     pub(crate) fn has_immutables(&self) -> bool { !self.immutables.is_empty() }
 
     /// Performs a read operation on the memtable with minimal locking
-    pub(crate) fn get(&self, key: &[u8], timestamp: u64, seqno: u64) -> Option<InternalValue> {
+    pub(crate) fn get(&self, key: &[u8], timestamp: u64, seqno: u64) -> Option<Entry> {
         // First check the active memtable
         {
             let memtable = self.memtable.read().ok()?;
@@ -319,7 +319,7 @@ impl okaywal::LogManager for LogManager {
 
                     // Decode the InternalValue from this chunk
                     let mut value_cursor = std::io::Cursor::new(&chunk_data);
-                    if let Ok(internal_value) = InternalValue::decode_from(&mut value_cursor) {
+                    if let Ok(internal_value) = Entry::decode_from(&mut value_cursor) {
                         internal_values.push(internal_value);
                     } else {
                         // Failed to decode InternalValue, skip this chunk
@@ -748,9 +748,9 @@ mod tests {
     ) {
         let mem_manager = MemManager::new();
 
-        let internal_values: Vec<InternalValue> = values_spec
+        let internal_values: Vec<Entry> = values_spec
             .into_iter()
-            .map(|(key, value, timestamp, seqno)| InternalValue::make(key, timestamp, seqno, value))
+            .map(|(key, value, timestamp, seqno)| Entry::make(key, timestamp, seqno, value))
             .collect();
 
         let initial_size = mem_manager.current_size();

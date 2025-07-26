@@ -187,7 +187,7 @@ impl From<u8> for ValueType {
 pub type UserValue = Slice;
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct InternalValue {
+pub struct Entry {
     /// An internal key.
     pub key:   InternalKey,
     /// User-defined value - an arbitrary byte array
@@ -196,7 +196,7 @@ pub struct InternalValue {
     pub value: UserValue,
 }
 
-impl InternalValue {
+impl Entry {
     /// Returns the serialized size of this InternalValue in bytes.
     /// This includes:
     /// - the serialized size of the key,
@@ -222,7 +222,7 @@ impl InternalValue {
     }
 }
 
-impl std::fmt::Debug for InternalValue {
+impl std::fmt::Debug for Entry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -233,7 +233,7 @@ impl std::fmt::Debug for InternalValue {
     }
 }
 
-impl Codec for InternalValue {
+impl Codec for Entry {
     fn encode_into<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
         self.key.encode_into(writer)?;
         writer.write_u64::<LittleEndian>(self.value.len() as u64)?;
@@ -249,6 +249,66 @@ impl Codec for InternalValue {
         Ok(Self {
             key,
             value: Slice::from(value),
+        })
+    }
+}
+
+/// An entry in an index block that maps a key to a data block location.
+///
+/// Index entries are used to quickly locate which data block contains
+/// a particular key range. Each index entry contains:
+/// - The last key in a data block
+/// - The file offset where that data block starts
+/// - The size of the data block in bytes
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct IndexEntry {
+    /// The last key in the data block this entry points to
+    pub key:          InternalKey,
+    /// File offset where the data block starts
+    pub block_offset: u64,
+    /// Size of the data block in bytes
+    pub block_size:   u64,
+}
+
+impl IndexEntry {
+    /// Creates a new index entry.
+    pub fn new(key: InternalKey, block_offset: u64, block_size: u64) -> Self {
+        Self {
+            key,
+            block_offset,
+            block_size,
+        }
+    }
+
+    /// Returns the serialized size of this IndexEntry in bytes.
+    /// This includes:
+    /// - The serialized size of the key
+    /// - 8 bytes for block_offset (u64)
+    /// - 8 bytes for block_size (u64)
+    pub fn size(&self) -> u64 { self.key.size() + 8 + 8 }
+}
+
+impl Codec for IndexEntry {
+    fn encode_into<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        // Encode the key first
+        self.key.encode_into(writer)?;
+        // Then the block offset and size
+        writer.write_u64::<LittleEndian>(self.block_offset)?;
+        writer.write_u64::<LittleEndian>(self.block_size)?;
+        Ok(())
+    }
+
+    fn decode_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        // Decode the key first
+        let key = InternalKey::decode_from(reader)?;
+        // Then the block offset and size
+        let block_offset = reader.read_u64::<LittleEndian>()?;
+        let block_size = reader.read_u64::<LittleEndian>()?;
+
+        Ok(Self {
+            key,
+            block_offset,
+            block_size,
         })
     }
 }
