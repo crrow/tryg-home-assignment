@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{io::Cursor, path::Path};
+use std::{io::Cursor, path::Path, sync::Arc};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
@@ -21,6 +21,7 @@ use snafu::{ResultExt, ensure};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::Mutex,
 };
 
 use crate::{
@@ -390,94 +391,114 @@ impl TableBuilder {
     pub(crate) fn data_blocks(&self) -> &[(InternalKey, u64, u64, u32)] { &self.data_blocks }
 }
 
-/// A lazy block reader that only reads entry metadata initially.
+/// An entry that can lazily read its data from the underlying file.
 ///
-/// This allows us to iterate through entry positions without loading
-/// the actual entry data until it's requested.
-pub(crate) struct LazyBlockReader {
-    /// File handle for reading entry data on demand
-    file:          File,
-    /// Starting offset of this block in the file
-    block_offset:  u64,
-    /// Entry offsets within the block (relative to block start)
-    entry_offsets: Vec<u64>,
-    /// Number of entries in this block
-    entry_count:   u32,
+/// This provides the same interface as Entry but only reads the actual
+/// entry data when it's accessed, making iterations memory-efficient.
+#[derive(Debug, Clone)]
+pub(crate) struct IoEntry {
+    /// Shared file handle for reading entry data
+    file:         Arc<Mutex<File>>,
+    /// Starting offset of the block containing this entry
+    block_offset: u64,
+    /// Size of the block containing this entry
+    block_size:   u64,
+    /// Index of this entry within the block
+    entry_index:  usize,
+    /// Cached entry data (loaded lazily)
+    cached_entry: Option<Entry>,
 }
 
-impl LazyBlockReader {
-    /// Creates a new lazy block reader.
-    ///
-    /// This only reads the block metadata (entry count and offsets) without
-    /// loading any actual entry data.
-    pub(crate) async fn new(mut file: File, block_offset: u64, block_size: u64) -> Result<Self> {
+impl IoEntry {
+    /// Creates a new IoEntry.
+    pub(crate) fn new(
+        file: Arc<Mutex<File>>,
+        block_offset: u64,
+        block_size: u64,
+        entry_index: usize,
+    ) -> Self {
+        Self {
+            file,
+            block_offset,
+            block_size,
+            entry_index,
+            cached_entry: None,
+        }
+    }
+
+    /// Lazily loads and returns the entry data.
+    pub(crate) async fn entry(&mut self) -> Result<&Entry> {
+        if self.cached_entry.is_none() {
+            let entry = self.read_entry_data().await?;
+            self.cached_entry = Some(entry);
+        }
+        Ok(self.cached_entry.as_ref().unwrap())
+    }
+
+    /// Gets the key without loading the full entry (if cached).
+    /// If not cached, this will load the full entry.
+    pub(crate) async fn key(&mut self) -> Result<&InternalKey> {
+        let entry = self.entry().await?;
+        Ok(&entry.key)
+    }
+
+    /// Gets the value without loading the full entry (if cached).
+    /// If not cached, this will load the full entry.
+    pub(crate) async fn value(&mut self) -> Result<&[u8]> {
+        let entry = self.entry().await?;
+        Ok(&entry.value)
+    }
+
+    /// Reads the entry data from the file.
+    async fn read_entry_data(&self) -> Result<Entry> {
+        let mut file = self.file.lock().await;
+
         // Read entry count from the last 4 bytes of the block
-        file.seek(std::io::SeekFrom::Start(block_offset + block_size - 4))
-            .await
-            .context(IOSnafu)?;
+        file.seek(std::io::SeekFrom::Start(
+            self.block_offset + self.block_size - 4,
+        ))
+        .await
+        .context(IOSnafu)?;
         let mut count_buf = [0u8; 4];
         file.read_exact(&mut count_buf).await.context(IOSnafu)?;
         let entry_count = u32::from_le_bytes(count_buf);
 
-        // Read offset table
-        let offset_section_size = entry_count as u64 * 8; // 8 bytes per u64 offset
-        let offset_table_start = block_offset + block_size - 4 - offset_section_size;
-
-        file.seek(std::io::SeekFrom::Start(offset_table_start))
-            .await
-            .context(IOSnafu)?;
-        let mut offset_buf = vec![0u8; offset_section_size as usize];
-        file.read_exact(&mut offset_buf).await.context(IOSnafu)?;
-
-        // Parse offsets
-        let entry_offsets = offset_buf
-            .chunks_exact(8)
-            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
-            .collect();
-
-        Ok(Self {
-            file,
-            block_offset,
-            entry_offsets,
-            entry_count,
-        })
-    }
-
-    /// Returns the number of entries in this block.
-    pub(crate) fn entry_count(&self) -> usize { self.entry_count as usize }
-
-    /// Returns true if the block is empty.
-    pub(crate) fn is_empty(&self) -> bool { self.entry_count == 0 }
-
-    /// Reads a specific entry by index.
-    ///
-    /// This performs I/O to read only the requested entry data.
-    pub(crate) async fn read_entry(&mut self, index: usize) -> Result<Entry> {
-        // Ensure the index is within bounds
-        if index >= self.entry_count as usize {
+        // Validate entry index
+        if self.entry_index >= entry_count as usize {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "Entry index {} out of bounds, valid range: 0..{}",
-                    index, self.entry_count
+                    self.entry_index, entry_count
                 ),
             ))
             .context(IOSnafu);
         }
 
-        let entry_offset = self.block_offset + self.entry_offsets[index];
-        self.file
-            .seek(std::io::SeekFrom::Start(entry_offset))
+        // Read offset for the specific entry
+        let offset_section_size = entry_count as u64 * 8; // 8 bytes per u64 offset
+        let offset_table_start = self.block_offset + self.block_size - 4 - offset_section_size;
+        let entry_offset_pos = offset_table_start + (self.entry_index as u64 * 8);
+
+        file.seek(std::io::SeekFrom::Start(entry_offset_pos))
+            .await
+            .context(IOSnafu)?;
+        let mut offset_buf = [0u8; 8];
+        file.read_exact(&mut offset_buf).await.context(IOSnafu)?;
+        let entry_offset = u64::from_le_bytes(offset_buf);
+
+        // Read the entry data
+        let absolute_entry_offset = self.block_offset + entry_offset;
+        file.seek(std::io::SeekFrom::Start(absolute_entry_offset))
             .await
             .context(IOSnafu)?;
 
-        // Read the entry using a buffered approach
-        // We'll read a reasonable chunk and decode from it
-        let mut buffer = Vec::with_capacity(1024); // Start with 1KB buffer
+        // Read entry using buffered approach
+        let mut buffer = Vec::with_capacity(1024);
         let mut temp_buf = [0u8; 1024];
 
         // Read initial chunk
-        let bytes_read = self.file.read(&mut temp_buf).await.context(IOSnafu)?;
+        let bytes_read = file.read(&mut temp_buf).await.context(IOSnafu)?;
         buffer.extend_from_slice(&temp_buf[..bytes_read]);
 
         // Try to decode the entry
@@ -490,7 +511,7 @@ impl LazyBlockReader {
                     let current_pos = cursor.position() as usize;
                     if current_pos == buffer.len() {
                         // We've consumed all available data, read more
-                        let bytes_read = self.file.read(&mut temp_buf).await.context(IOSnafu)?;
+                        let bytes_read = file.read(&mut temp_buf).await.context(IOSnafu)?;
                         if bytes_read == 0 {
                             // End of file reached
                             return Err(std::io::Error::new(
@@ -510,87 +531,31 @@ impl LazyBlockReader {
             }
         }
     }
-
-    /// Creates an iterator over all entries in this block.
-    pub(crate) fn iter(&mut self) -> LazyBlockIterator { LazyBlockIterator::new(self) }
 }
 
-/// Iterator that lazily loads entries from a block.
-pub(crate) struct LazyBlockIterator<'a> {
-    block_reader:  &'a mut LazyBlockReader,
-    current_index: usize,
-}
-
-impl<'a> LazyBlockIterator<'a> {
-    fn new(block_reader: &'a mut LazyBlockReader) -> Self {
-        Self {
-            block_reader,
-            current_index: 0,
-        }
-    }
-
-    /// Advances to the next entry and returns it.
-    ///
-    /// This performs I/O only when an entry is actually requested.
-    pub(crate) async fn next(&mut self) -> Result<Option<Entry>> {
-        if self.current_index >= self.block_reader.entry_count() {
-            return Ok(None);
-        }
-
-        let entry = self.block_reader.read_entry(self.current_index).await?;
-        self.current_index += 1;
-        Ok(Some(entry))
-    }
-
-    /// Peeks at the current entry without advancing the iterator.
-    pub(crate) async fn peek(&mut self) -> Result<Option<Entry>> {
-        if self.current_index >= self.block_reader.entry_count() {
-            return Ok(None);
-        }
-
-        self.block_reader
-            .read_entry(self.current_index)
-            .await
-            .map(Some)
-    }
-
-    /// Returns the current position in the iterator.
-    pub(crate) fn position(&self) -> usize { self.current_index }
-
-    /// Seeks to a specific position in the iterator.
-    pub(crate) fn seek_to(&mut self, index: usize) {
-        self.current_index = index.min(self.block_reader.entry_count());
-    }
-}
-
-/// A production-ready table reader for reading SSTable files using tokio async
-/// I/O.
+/// A simplified table reader that loads data lazily and provides a clean
+/// interface.
 ///
-/// Features:
-/// - Data integrity verification with CRC32 checksums
-/// - Efficient block-level access via index
-/// - Point and range queries
-/// - Support for iteration over entries
-/// - Async I/O using tokio::fs
-/// - Lazy loading of footer, index, and entry data
-/// - Memory-efficient: only loads entry data when actually accessed
-#[allow(dead_code)]
+/// This replaces the complex TableReader/LazyBlockReader separation with a
+/// unified approach that loads the footer and index immediately, but loads
+/// entry data lazily.
 pub(crate) struct TableReader {
-    /// The underlying file reader
-    file:        File,
-    /// Table footer containing metadata (lazily loaded)
-    footer:      Option<TableFooter>,
-    /// Index block for efficient lookups (lazily loaded)
-    index_block: Option<Vec<IndexEntry>>,
+    /// The underlying file reader (wrapped in Arc<Mutex> for sharing with
+    /// IoEntry)
+    file:          Arc<Mutex<File>>,
+    /// Table footer containing metadata
+    footer:        TableFooter,
+    /// Index block for efficient lookups
+    index_entries: Vec<IndexEntry>,
     /// File size for validation
-    file_size:   u64,
+    file_size:     u64,
 }
 
 impl TableReader {
     /// Creates a new table reader from a file.
     ///
     /// This loads the footer and index block immediately for efficient queries,
-    /// but entry data is still loaded lazily on demand.
+    /// but entry data is loaded lazily on demand.
     pub(crate) async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let metadata = tokio::fs::metadata(path.as_ref()).await.context(IOSnafu)?;
         let file_size = metadata.len();
@@ -601,7 +566,9 @@ impl TableReader {
                 path:   path.as_ref().to_string_lossy().to_string(),
             }
         );
+
         let mut file = File::open(path.as_ref()).await.context(IOSnafu)?;
+
         // Read footer size from the last 4 bytes
         file.seek(std::io::SeekFrom::Start(file_size - 4))
             .await
@@ -657,9 +624,9 @@ impl TableReader {
             }
         );
 
-        // Load the index block immediately
-        let index_block = if footer.index_size == 0 {
-            Some(Vec::new())
+        // Load the index block
+        let index_entries = if footer.index_size == 0 {
+            Vec::new()
         } else {
             // Read index data
             file.seek(std::io::SeekFrom::Start(footer.index_offset))
@@ -686,17 +653,16 @@ impl TableReader {
             // Parse index block
             let cursor = std::io::Cursor::new(index_buf);
             let mut reader = IndexBlockReader::new(cursor).context(IOSnafu)?;
-            let index_entries = reader
+            reader
                 .iter()
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .context(IOSnafu)?;
-            Some(index_entries)
+                .context(IOSnafu)?
         };
 
         Ok(Self {
-            file,
-            footer: Some(footer),
-            index_block,
+            file: Arc::new(Mutex::new(file)),
+            footer,
+            index_entries,
             file_size,
         })
     }
@@ -705,69 +671,73 @@ impl TableReader {
     ///
     /// Returns the block offset and size, or None if the key is outside the
     /// table's range.
-    pub(crate) fn find_block_for_key(&self, key: &InternalKey) -> Option<(u64, u64)> {
+    fn find_block_for_key(&self, key: &InternalKey) -> Option<(u64, u64)> {
         if !self.contains_key_range(key) {
             return None;
         }
 
-        if let Some(ref index_entries) = self.index_block {
-            // Binary search through index entries to find the appropriate block
-            match index_entries.binary_search_by(|entry| entry.key.cmp(key)) {
-                Ok(idx) => {
-                    // Exact match - the key is definitely in this block
+        if self.index_entries.is_empty() {
+            return None;
+        }
+
+        // Binary search through index entries to find the appropriate block
+        match self
+            .index_entries
+            .binary_search_by(|entry| entry.key.cmp(key))
+        {
+            Ok(idx) => {
+                // Exact match - the key is definitely in this block
+                Some((
+                    self.index_entries[idx].block_offset,
+                    self.index_entries[idx].block_size,
+                ))
+            }
+            Err(idx) => {
+                // Key would be inserted at idx, so it might be in the block at idx
+                if idx < self.index_entries.len() {
                     Some((
-                        index_entries[idx].block_offset,
-                        index_entries[idx].block_size,
+                        self.index_entries[idx].block_offset,
+                        self.index_entries[idx].block_size,
                     ))
-                }
-                Err(idx) => {
-                    // Key would be inserted at idx, so it might be in the block at idx
-                    if idx < index_entries.len() {
-                        Some((
-                            index_entries[idx].block_offset,
-                            index_entries[idx].block_size,
-                        ))
+                } else {
+                    // Key is larger than all index entries, check the last block
+                    if let Some(last_entry) = self.index_entries.last() {
+                        Some((last_entry.block_offset, last_entry.block_size))
                     } else {
-                        // Key is larger than all index entries, check the last block
-                        if let Some(last_entry) = index_entries.last() {
-                            Some((last_entry.block_offset, last_entry.block_size))
-                        } else {
-                            None
-                        }
+                        None
                     }
                 }
             }
-        } else {
-            None
         }
     }
 
-    /// Creates a lazy block reader for a specific data block.
-    ///
-    /// This only reads the block metadata initially.
-    pub(crate) async fn create_lazy_block_reader(
-        &mut self,
-        offset: u64,
-        size: u64,
-    ) -> Result<LazyBlockReader> {
-        // Clone the file handle for the block reader
-        let file = self.file.try_clone().await.context(IOSnafu)?;
-        LazyBlockReader::new(file, offset, size).await
+    /// Gets the number of entries in a specific block.
+    async fn get_block_entry_count(&self, block_offset: u64, block_size: u64) -> Result<u32> {
+        let mut file = self.file.lock().await;
+        // Read entry count from the last 4 bytes of the block
+        file.seek(std::io::SeekFrom::Start(block_offset + block_size - 4))
+            .await
+            .context(IOSnafu)?;
+        let mut count_buf = [0u8; 4];
+        file.read_exact(&mut count_buf).await.context(IOSnafu)?;
+        Ok(u32::from_le_bytes(count_buf))
     }
 
     /// Performs a point lookup for a specific key.
     ///
     /// Returns the entry if found, or None if the key doesn't exist in this
-    /// table. Only reads the specific entry data when found.
+    /// table.
     pub(crate) async fn get(&mut self, key: &InternalKey) -> Result<Option<Entry>> {
         if let Some((offset, size)) = self.find_block_for_key(key) {
-            let mut block_reader = self.create_lazy_block_reader(offset, size).await?;
-            let mut iter = block_reader.iter();
+            let entry_count = self.get_block_entry_count(offset, size).await?;
 
-            // Search through the block for the key
-            while let Some(entry) = iter.next().await? {
+            // Linear search through the block entries
+            // TODO: Could be optimized with binary search within the block
+            for entry_index in 0..entry_count as usize {
+                let mut io_entry = IoEntry::new(Arc::clone(&self.file), offset, size, entry_index);
+                let entry = io_entry.entry().await?;
                 match entry.key.cmp(key) {
-                    std::cmp::Ordering::Equal => return Ok(Some(entry)),
+                    std::cmp::Ordering::Equal => return Ok(Some(entry.clone())),
                     std::cmp::Ordering::Greater => break, // Keys are sorted, so we won't find it
                     std::cmp::Ordering::Less => continue,
                 }
@@ -776,29 +746,95 @@ impl TableReader {
         Ok(None)
     }
 
+    /// Returns a lazy iterator that yields IoEntry instances for all entries in
+    /// the table.
+    ///
+    /// This is much more memory-efficient than loading all entries into memory.
+    pub(crate) async fn iter(&self) -> Result<Vec<IoEntry>> {
+        let mut io_entries = Vec::new();
+
+        for index_entry in &self.index_entries {
+            let block_offset = index_entry.block_offset;
+            let block_size = index_entry.block_size;
+            let entry_count = self.get_block_entry_count(block_offset, block_size).await?;
+
+            for entry_index in 0..entry_count as usize {
+                let io_entry = IoEntry::new(
+                    Arc::clone(&self.file),
+                    block_offset,
+                    block_size,
+                    entry_index,
+                );
+                io_entries.push(io_entry);
+            }
+        }
+
+        Ok(io_entries)
+    }
+
+    /// Returns IoEntry instances for entries within a key range.
+    pub(crate) async fn range_iter(
+        &self,
+        start_key: &InternalKey,
+        end_key: &InternalKey,
+    ) -> Result<Vec<IoEntry>> {
+        let mut io_entries = Vec::new();
+
+        for index_entry in &self.index_entries {
+            // Skip blocks that are entirely before our range
+            if index_entry.key < *start_key {
+                continue;
+            }
+
+            let block_offset = index_entry.block_offset;
+            let block_size = index_entry.block_size;
+            let entry_count = self.get_block_entry_count(block_offset, block_size).await?;
+
+            for entry_index in 0..entry_count as usize {
+                let mut io_entry = IoEntry::new(
+                    Arc::clone(&self.file),
+                    block_offset,
+                    block_size,
+                    entry_index,
+                );
+
+                // Check if this entry is within our range by examining its key
+                let entry_key = io_entry.key().await?;
+                if entry_key < start_key {
+                    continue; // Skip entries before range
+                }
+                if entry_key > end_key {
+                    return Ok(io_entries); // Past end of range, we're done
+                }
+
+                io_entries.push(io_entry);
+            }
+        }
+
+        Ok(io_entries)
+    }
+
     /// Returns the table footer.
-    pub(crate) fn footer(&self) -> &TableFooter { self.footer.as_ref().unwrap() }
+    pub(crate) fn footer(&self) -> &TableFooter { &self.footer }
 
     /// Returns the number of entries in the table.
-    pub(crate) fn entry_count(&self) -> u32 { self.footer().entry_count }
+    pub(crate) fn entry_count(&self) -> u32 { self.footer.entry_count }
 
     /// Returns the first key in the table, if any.
-    pub(crate) fn first_key(&self) -> Option<&InternalKey> { self.footer().first_key.as_ref() }
+    pub(crate) fn first_key(&self) -> Option<&InternalKey> { self.footer.first_key.as_ref() }
 
     /// Returns the last key in the table, if any.
-    pub(crate) fn last_key(&self) -> Option<&InternalKey> { self.footer().last_key.as_ref() }
+    pub(crate) fn last_key(&self) -> Option<&InternalKey> { self.footer.last_key.as_ref() }
 
     /// Validates that a key is within the table's key range.
     pub(crate) fn contains_key_range(&self, key: &InternalKey) -> bool {
-        let footer = self.footer();
-
-        if let Some(ref first_key) = footer.first_key {
+        if let Some(ref first_key) = self.footer.first_key {
             if key < first_key {
                 return false;
             }
         }
 
-        if let Some(ref last_key) = footer.last_key {
+        if let Some(ref last_key) = self.footer.last_key {
             if key > last_key {
                 return false;
             }
@@ -806,236 +842,14 @@ impl TableReader {
 
         true
     }
-
-    /// Creates an iterator over all entries in the table.
-    /// The iterator will lazily load entry data as needed.
-    pub(crate) fn iter(&mut self) -> TableIterator { TableIterator::new(self) }
-
-    /// Creates an iterator over entries within a key range.
-    /// The iterator will lazily load entry data as needed.
-    pub(crate) fn range_iter(
-        &mut self,
-        start_key: InternalKey,
-        end_key: InternalKey,
-    ) -> TableRangeIterator {
-        TableRangeIterator::new(self, start_key, end_key)
-    }
-}
-
-/// Iterator over all entries in a table.
-///
-/// This efficiently streams through all entries in the table by lazily loading
-/// entry data on demand. Only the block metadata is loaded initially.
-pub(crate) struct TableIterator {
-    table_reader:         *mut TableReader, // Raw pointer to avoid borrowing issues
-    current_block_reader: Option<LazyBlockReader>,
-    current_block_iter:   Option<LazyBlockIterator<'static>>,
-    current_block_index:  usize,
-    initialized:          bool,
-    finished:             bool,
-}
-
-impl TableIterator {
-    fn new(table_reader: &mut TableReader) -> Self {
-        Self {
-            table_reader:         table_reader as *mut TableReader,
-            current_block_reader: None,
-            current_block_iter:   None,
-            current_block_index:  0,
-            initialized:          false,
-            finished:             false,
-        }
-    }
-
-    /// Loads the next data block for iteration.
-    async fn load_next_block(&mut self) -> Result<bool> {
-        let table_reader = unsafe { &mut *self.table_reader };
-
-        if let Some(ref index_entries) = table_reader.index_block {
-            if self.current_block_index >= index_entries.len() {
-                return Ok(false); // No more blocks
-            }
-
-            let entry = &index_entries[self.current_block_index];
-            let block_reader = table_reader
-                .create_lazy_block_reader(entry.block_offset, entry.block_size)
-                .await?;
-
-            // Create iterator with proper lifetime handling
-            self.current_block_reader = Some(block_reader);
-            // We need to use unsafe here to extend the lifetime
-            let iter = unsafe {
-                let block_reader_ref = self.current_block_reader.as_mut().unwrap();
-                std::mem::transmute(block_reader_ref.iter())
-            };
-            self.current_block_iter = Some(iter);
-            self.current_block_index += 1;
-
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// Advances to the next entry in the table.
-    pub(crate) async fn next(&mut self) -> Result<Option<Entry>> {
-        if self.finished {
-            return Ok(None);
-        }
-
-        loop {
-            // Try to get next entry from current block
-            if let Some(ref mut iter) = self.current_block_iter {
-                if let Some(entry) = iter.next().await? {
-                    return Ok(Some(entry));
-                }
-            }
-
-            // Current block is exhausted, try to load next block
-            if !self.load_next_block().await? {
-                self.finished = true;
-                return Ok(None);
-            }
-        }
-    }
-}
-
-/// Iterator over entries within a key range.
-///
-/// This efficiently streams through entries within a specified key range,
-/// lazily loading entry data on demand.
-pub(crate) struct TableRangeIterator {
-    table_reader:         *mut TableReader, // Raw pointer to avoid borrowing issues
-    start_key:            InternalKey,
-    end_key:              InternalKey,
-    current_block_reader: Option<LazyBlockReader>,
-    current_block_iter:   Option<LazyBlockIterator<'static>>,
-    current_block_index:  usize,
-    initialized:          bool,
-    finished:             bool,
-}
-
-impl TableRangeIterator {
-    fn new(table_reader: &mut TableReader, start_key: InternalKey, end_key: InternalKey) -> Self {
-        Self {
-            table_reader: table_reader as *mut TableReader,
-            start_key,
-            end_key,
-            current_block_reader: None,
-            current_block_iter: None,
-            current_block_index: 0,
-            initialized: false,
-            finished: false,
-        }
-    }
-
-    /// Initializes the iterator by loading the index and finding the start
-    /// block.
-    async fn ensure_initialized(&mut self) -> Result<()> {
-        if self.initialized {
-            return Ok(());
-        }
-
-        let table_reader = unsafe { &mut *self.table_reader };
-        // table_reader.ensure_index_loaded().await?; // This is now eagerly loaded
-
-        // Find the starting block for the range
-        if let Some(ref index_entries) = table_reader.index_block {
-            // Find the first block that might contain keys >= start_key
-            match index_entries.binary_search_by(|entry| entry.key.cmp(&self.start_key)) {
-                Ok(idx) => {
-                    self.current_block_index = idx;
-                }
-                Err(idx) => {
-                    // The start_key would be inserted at idx, so start from the previous block
-                    // to ensure we don't miss any entries
-                    self.current_block_index = idx.saturating_sub(1);
-                }
-            }
-        }
-
-        self.initialized = true;
-        Ok(())
-    }
-
-    /// Loads the next data block for iteration within the range.
-    async fn load_next_block(&mut self) -> Result<bool> {
-        self.ensure_initialized().await?;
-
-        let table_reader = unsafe { &mut *self.table_reader };
-
-        if let Some(ref index_entries) = table_reader.index_block {
-            if self.current_block_index >= index_entries.len() {
-                return Ok(false); // No more blocks
-            }
-
-            let entry = &index_entries[self.current_block_index];
-
-            // Check if this block might contain keys beyond our end range
-            if entry.key < self.start_key {
-                self.current_block_index += 1;
-                return Box::pin(self.load_next_block()).await; // Skip this block
-            }
-
-            let block_reader = table_reader
-                .create_lazy_block_reader(entry.block_offset, entry.block_size)
-                .await?;
-
-            // Create iterator with proper lifetime handling
-            self.current_block_reader = Some(block_reader);
-            let iter = unsafe {
-                let block_reader_ref = self.current_block_reader.as_mut().unwrap();
-                std::mem::transmute(block_reader_ref.iter())
-            };
-            self.current_block_iter = Some(iter);
-            self.current_block_index += 1;
-
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// Advances to the next entry in the range.
-    pub(crate) async fn next(&mut self) -> Result<Option<Entry>> {
-        if self.finished {
-            return Ok(None);
-        }
-
-        loop {
-            // Try to get next entry from current block
-            if let Some(ref mut iter) = self.current_block_iter {
-                while let Some(entry) = iter.next().await? {
-                    // Check if entry is within our range
-                    if entry.key < self.start_key {
-                        continue; // Skip entries before range
-                    }
-                    if entry.key > self.end_key {
-                        self.finished = true;
-                        return Ok(None); // Past end of range
-                    }
-
-                    return Ok(Some(entry));
-                }
-            }
-
-            // Current block is exhausted, try to load next block
-            if !self.load_next_block().await? {
-                self.finished = true;
-                return Ok(None);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
 
     use tempfile::NamedTempFile;
-    use tokio::{fs::File, io::AsyncWriteExt};
 
     use super::*;
-    use crate::format::{UserKey, ValueType};
 
     /// Helper function to create test entries
     fn create_test_entry(key: &str, value: &str, seqno: u64) -> Entry {
@@ -1068,99 +882,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lazy_block_reader_basic() {
-        // Create test entries
-        let entries = vec![
-            create_test_entry("key1", "value1", 1),
-            create_test_entry("key2", "value2", 2),
-            create_test_entry("key3", "value3", 3),
-        ];
-
-        let (temp_file, file_size) = create_test_sstable(entries.clone()).await;
-        let mut table_reader = TableReader::open(temp_file.path())
-            .await
-            .expect("Failed to create table reader");
-
-        // Get first block info
-        let index_entries = table_reader.index_block.as_ref().unwrap();
-        assert!(!index_entries.is_empty(), "Index should have entries");
-
-        let first_block = &index_entries[0];
-
-        // Create lazy block reader
-        let file = File::open(temp_file.path())
-            .await
-            .expect("Failed to open file");
-        let mut lazy_reader =
-            LazyBlockReader::new(file, first_block.block_offset, first_block.block_size)
-                .await
-                .expect("Failed to create lazy block reader");
-
-        // Verify block metadata is loaded
-        assert_eq!(lazy_reader.entry_count(), entries.len());
-        assert!(!lazy_reader.is_empty());
-
-        // Read entries one by one
-        for (i, expected_entry) in entries.iter().enumerate() {
-            let actual_entry = lazy_reader
-                .read_entry(i)
-                .await
-                .expect("Failed to read entry");
-            assert_eq!(actual_entry.key, expected_entry.key);
-            assert_eq!(actual_entry.value, expected_entry.value);
-        }
-
-        // Test out of bounds
-        let result = lazy_reader.read_entry(entries.len()).await;
-        assert!(result.is_err(), "Should fail for out of bounds index");
-    }
-
-    #[tokio::test]
-    async fn test_lazy_block_iterator() {
-        let entries = vec![
-            create_test_entry("key1", "value1", 1),
-            create_test_entry("key2", "value2", 2),
-            create_test_entry("key3", "value3", 3),
-        ];
-
-        let (temp_file, file_size) = create_test_sstable(entries.clone()).await;
-        let mut table_reader = TableReader::open(temp_file.path())
-            .await
-            .expect("Failed to create table reader");
-
-        // table_reader
-        //     .ensure_index_loaded()
-        //     .await
-        //     .expect("Failed to load index");
-        let first_block = &table_reader.index_block.as_ref().unwrap()[0];
-
-        let file = File::open(temp_file.path())
-            .await
-            .expect("Failed to open file");
-        let mut lazy_reader =
-            LazyBlockReader::new(file, first_block.block_offset, first_block.block_size)
-                .await
-                .expect("Failed to create lazy block reader");
-
-        let mut iter = lazy_reader.iter();
-
-        // Test iterator
-        for expected_entry in &entries {
-            let actual_entry = iter
-                .next()
-                .await
-                .expect("Failed to get next entry")
-                .expect("Entry should exist");
-            assert_eq!(actual_entry.key, expected_entry.key);
-            assert_eq!(actual_entry.value, expected_entry.value);
-        }
-
-        // Should return None after all entries are consumed
-        let result = iter.next().await.expect("Failed to get next entry");
-        assert!(result.is_none(), "Iterator should be exhausted");
-    }
-
-    #[tokio::test]
     async fn test_table_reader_lazy_loading() {
         let entries = vec![
             create_test_entry("key1", "value1", 1),
@@ -1168,43 +889,19 @@ mod tests {
             create_test_entry("key3", "value3", 3),
         ];
 
-        let (temp_file, file_size) = create_test_sstable(entries.clone()).await;
+        let (temp_file, _file_size) = create_test_sstable(entries.clone()).await;
         let mut table_reader = TableReader::open(temp_file.path())
             .await
             .expect("Failed to create table reader");
 
-        // Verify footer and index are not loaded yet
-        assert!(
-            table_reader.footer.is_some(),
-            "Footer should be loaded after initialization"
-        );
-        assert!(
-            table_reader.index_block.is_some(),
-            "Index should be loaded after initialization"
-        );
-
         // Test immediate access to metadata
         let entry_count = table_reader.entry_count();
         assert_eq!(entry_count, entries.len() as u32);
-        assert!(
-            table_reader.footer.is_some(),
-            "Footer should be loaded after first access"
-        );
 
-        // Index should still not be loaded
-        assert!(
-            table_reader.index_block.is_some(),
-            "Index should not be loaded until needed"
-        );
-
-        // Performing a get operation should trigger index loading
+        // Performing a get operation
         let key = &entries[1].key;
         let result = table_reader.get(key).await.expect("Failed to perform get");
         assert!(result.is_some(), "Should find the key");
-        assert!(
-            table_reader.index_block.is_some(),
-            "Index should be loaded after get operation"
-        );
 
         let found_entry = result.unwrap();
         assert_eq!(found_entry.key, entries[1].key);
@@ -1212,67 +909,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_iterator_lazy_loading() {
+    async fn test_table_reader_all_entries() {
         let entries = vec![
             create_test_entry("key1", "value1", 1),
             create_test_entry("key2", "value2", 2),
             create_test_entry("key3", "value3", 3),
-            create_test_entry("key4", "value4", 4),
-            create_test_entry("key5", "value5", 5),
         ];
 
-        let (temp_file, file_size) = create_test_sstable(entries.clone()).await;
-        let mut table_reader = TableReader::open(temp_file.path())
+        let (temp_file, _file_size) = create_test_sstable(entries.clone()).await;
+        let table_reader = TableReader::open(temp_file.path())
             .await
             .expect("Failed to create table reader");
 
-        // Create iterator - should not load anything yet
-        let mut iter = table_reader.iter();
-        assert!(
-            table_reader.index_block.is_some(),
-            "Index should be loaded when creating iterator"
-        );
-
-        // First next() call should trigger index loading
-        let first_entry = iter
-            .next()
+        let all_entries = table_reader
+            .iter()
             .await
-            .expect("Failed to get first entry")
-            .expect("Should have entries");
-        assert!(
-            unsafe { &*iter.table_reader }.index_block.is_some(),
-            "Index should be loaded after first next()"
-        );
-
-        assert_eq!(first_entry.key, entries[0].key);
-        assert_eq!(first_entry.value, entries[0].value);
-
-        // Continue iterating through all entries
-        for (i, expected_entry) in entries.iter().enumerate().skip(1) {
-            let actual_entry = iter
-                .next()
-                .await
-                .expect("Failed to get next entry")
-                .expect("Should have more entries");
-            assert_eq!(
-                actual_entry.key, expected_entry.key,
-                "Mismatch at index {}",
-                i
-            );
-            assert_eq!(
-                actual_entry.value, expected_entry.value,
-                "Mismatch at index {}",
-                i
-            );
+            .expect("Failed to get all entries");
+        assert_eq!(all_entries.len(), entries.len());
+        for (i, mut io_entry) in all_entries.into_iter().enumerate() {
+            let entry = io_entry.entry().await.expect("Failed to get entry");
+            assert_eq!(entry.key, entries[i].key);
+            assert_eq!(entry.value, entries[i].value);
         }
-
-        // Should return None after all entries
-        let result = iter.next().await.expect("Failed to get next entry");
-        assert!(result.is_none(), "Iterator should be exhausted");
     }
 
     #[tokio::test]
-    async fn test_range_iterator_lazy_loading() {
+    async fn test_table_reader_range_entries() {
         let entries = vec![
             create_test_entry("key1", "value1", 1),
             create_test_entry("key2", "value2", 2),
@@ -1281,8 +943,8 @@ mod tests {
             create_test_entry("key5", "value5", 5),
         ];
 
-        let (temp_file, file_size) = create_test_sstable(entries.clone()).await;
-        let mut table_reader = TableReader::open(temp_file.path())
+        let (temp_file, _file_size) = create_test_sstable(entries.clone()).await;
+        let table_reader = TableReader::open(temp_file.path())
             .await
             .expect("Failed to create table reader");
 
@@ -1290,116 +952,18 @@ mod tests {
         let start_key = entries[1].key.clone(); // key2
         let end_key = entries[3].key.clone(); // key4
 
-        let mut range_iter = table_reader.range_iter(start_key.clone(), end_key.clone());
-        assert!(
-            table_reader.index_block.is_some(),
-            "Index should be loaded when creating range iterator"
-        );
-
-        // First next() call should trigger index loading and find start block
-        let first_entry = range_iter
-            .next()
+        let range_entries = table_reader
+            .range_iter(&start_key, &end_key)
             .await
-            .expect("Failed to get first entry")
-            .expect("Should have entries in range");
-        assert!(
-            unsafe { &*range_iter.table_reader }.index_block.is_some(),
-            "Index should be loaded after first next()"
-        );
+            .expect("Failed to get range entries");
+        assert_eq!(range_entries.len(), 3); // key2, key3, key4
 
-        // Should get entries within range: key2, key3, key4
         let expected_in_range = &entries[1..4]; // key2, key3, key4
-        let mut actual_entries = vec![first_entry];
-
-        while let Some(entry) = range_iter.next().await.expect("Failed to get next entry") {
-            actual_entries.push(entry);
+        for (mut actual, expected) in range_entries.into_iter().zip(expected_in_range.iter()) {
+            let entry = actual.entry().await.expect("Failed to get entry");
+            assert_eq!(entry.key, expected.key);
+            assert_eq!(entry.value, expected.value);
         }
-
-        assert_eq!(actual_entries.len(), expected_in_range.len());
-        for (actual, expected) in actual_entries.iter().zip(expected_in_range.iter()) {
-            assert_eq!(actual.key, expected.key);
-            assert_eq!(actual.value, expected.value);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_multiple_blocks_lazy_loading() {
-        // Create enough entries to span multiple blocks
-        let mut entries = Vec::new();
-        for i in 0..100 {
-            let key = format!("key{:03}", i);
-            let value = format!("value{:03}", i);
-            entries.push(create_test_entry(&key, &value, i as u64));
-        }
-
-        let (temp_file, file_size) = create_test_sstable(entries.clone()).await;
-        let mut table_reader = TableReader::open(temp_file.path())
-            .await
-            .expect("Failed to create table reader");
-
-        // Verify we have multiple blocks
-        // table_reader
-        //     .ensure_index_loaded()
-        //     .await
-        //     .expect("Failed to load index");
-        let block_count = table_reader.index_block.as_ref().unwrap().len();
-
-        if block_count > 1 {
-            // Test that we can access entries from different blocks
-            let first_entry = table_reader
-                .get(&entries[0].key)
-                .await
-                .expect("Failed to get first entry")
-                .expect("Should find first entry");
-            let last_entry = table_reader
-                .get(&entries.last().unwrap().key)
-                .await
-                .expect("Failed to get last entry")
-                .expect("Should find last entry");
-
-            assert_eq!(first_entry.key, entries[0].key);
-            assert_eq!(last_entry.key, entries.last().unwrap().key);
-
-            // Test iterator across multiple blocks
-            let mut table_reader2 = TableReader::open(temp_file.path())
-                .await
-                .expect("Failed to create table reader");
-            let mut iter = table_reader2.iter();
-
-            let mut count = 0;
-            while let Some(_) = iter.next().await.expect("Failed to iterate") {
-                count += 1;
-            }
-
-            assert_eq!(
-                count,
-                entries.len(),
-                "Should iterate through all entries across multiple blocks"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_lazy_loading_error_handling() {
-        let entries = vec![create_test_entry("key1", "value1", 1)];
-
-        let (temp_file, file_size) = create_test_sstable(entries.clone()).await;
-
-        // Create a very small file for testing invalid file size
-        let small_temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        std::fs::write(small_temp_file.path(), b"small").expect("Failed to write small file");
-
-        let result = TableReader::open(small_temp_file.path()).await; // Too small
-        assert!(result.is_err(), "Should fail with invalid file size");
-
-        // Test with valid file
-        let mut table_reader = TableReader::open(temp_file.path())
-            .await
-            .expect("Failed to create table reader");
-
-        // This should work normally
-        let entry_count = table_reader.entry_count();
-        assert_eq!(entry_count, 1);
     }
 
     #[tokio::test]
@@ -1411,7 +975,7 @@ mod tests {
         ];
 
         let (temp_file, _) = create_test_sstable(entries.clone()).await;
-        let mut table_reader = TableReader::open(temp_file.path())
+        let table_reader = TableReader::open(temp_file.path())
             .await
             .expect("Failed to create table reader");
 
