@@ -13,17 +13,12 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap,
-    fs::File,
     hash::Hash,
-    io::{IoSlice, Read, Seek, SeekFrom, Write},
-    sync::{Arc, Mutex},
+    io::{Read, Seek, SeekFrom, Write},
 };
 
-use byteorder::ReadBytesExt;
 use snafu::ResultExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use value_log::Slice;
 
 use crate::{
     format::{Codec, Entry, IndexEntry, InternalKey},
@@ -1188,7 +1183,7 @@ mod tests {
             let found = reader
                 .get_at_index(i)
                 .expect("Failed to get entry at index");
-            assert!(found.is_some(), "Should find entry at index {}", i);
+            assert!(found.is_some(), "Should find entry at index {i}");
             let found_entry = found.unwrap();
             assert_eq!(found_entry.key, expected_entry.key);
             assert_eq!(found_entry.value, expected_entry.value);
@@ -1241,8 +1236,8 @@ mod tests {
         // Create entries with predictable keys
         let mut entries = Vec::new();
         for i in 0..num_entries {
-            let key = format!("key{:06}", i);
-            let value = format!("value{}", i);
+            let key = format!("key{i:06}");
+            let value = format!("value{i}");
             let entry = create_test_value(&key, 100, i as u64, &value);
             entries.push(entry.clone());
             builder.add(entry);
@@ -1267,7 +1262,7 @@ mod tests {
             let found = reader
                 .get_at_index(i)
                 .expect("Failed to get entry at index");
-            assert!(found.is_some(), "Should find entry at index {}", i);
+            assert!(found.is_some(), "Should find entry at index {i}");
             let found_entry = found.unwrap();
             assert_eq!(found_entry.key, expected_entry.key);
             assert_eq!(found_entry.value, expected_entry.value);

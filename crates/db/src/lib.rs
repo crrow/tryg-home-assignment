@@ -13,9 +13,16 @@
 // limitations under the License.
 
 pub(crate) mod batch;
+pub(crate) mod compaction;
 pub mod db;
 pub(crate) mod err;
 pub(crate) mod format;
 pub(crate) mod mem;
 pub(crate) mod memtable;
 pub(crate) mod sst;
+
+// Re-export public API
+pub use batch::WriteBatch;
+pub use compaction::CompactionOptions;
+pub use db::{DB, DatabaseStats, Options};
+pub use err::{Error, Result};

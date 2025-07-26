@@ -203,6 +203,29 @@ impl MemManager {
     /// Returns true if there are any immutable memtables
     pub(crate) fn has_immutables(&self) -> bool { !self.immutables.is_empty() }
 
+    /// Returns all immutable memtables for flushing to disk
+    pub(crate) fn get_immutable_tables(&self) -> Vec<(u64, Arc<MemTable>)> {
+        let tables = self.immutables.read_tables();
+        tables.iter().cloned().collect()
+    }
+
+    /// Removes an immutable memtable by ID (after successful flush)
+    pub(crate) fn remove_immutable(&self, table_id: u64) -> Option<Arc<MemTable>> {
+        self.immutables.remove(table_id)
+    }
+
+    /// Performs a read operation on the active memtable (for range queries)
+    pub(crate) fn read_memtable<F, R>(&self, f: F) -> std::io::Result<R>
+    where
+        F: FnOnce(&MemTable) -> R,
+    {
+        let memtable = self
+            .memtable
+            .read()
+            .map_err(|_| std::io::Error::other("Failed to acquire memtable lock"))?;
+        Ok(f(&memtable))
+    }
+
     /// Performs a read operation on the memtable with minimal locking
     pub(crate) fn get(&self, key: &[u8], timestamp: u64, seqno: u64) -> Option<Entry> {
         // First check the active memtable
@@ -369,10 +392,13 @@ impl okaywal::LogManager for LogManager {
     fn checkpoint_to(
         &mut self,
         _last_checkpointed_id: okaywal::EntryId,
-        checkpointed_entries: &mut okaywal::SegmentReader,
+        _checkpointed_entries: &mut okaywal::SegmentReader,
         _wal: &okaywal::WriteAheadLog,
     ) -> std::io::Result<()> {
-        todo!()
+        // For now, we just acknowledge the checkpoint
+        // In a real implementation, this would flush data to persistent storage
+        // and remove the checkpointed WAL segments
+        Ok(())
     }
 
     /// Determines whether a segment should be recovered.

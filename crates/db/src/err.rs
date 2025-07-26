@@ -14,6 +14,8 @@
 
 use snafu::{Location, Snafu};
 
+use crate::sst;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Snafu, Debug)]
@@ -24,4 +26,7 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(transparent)]
+    SstError { source: sst::err::Error },
 }

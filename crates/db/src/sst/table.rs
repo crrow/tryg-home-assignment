@@ -12,97 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # SSTable (Sorted String Table) Implementation
-//!
-//! This module provides a refined, memory-efficient implementation of SSTable
-//! reading and writing with lazy loading capabilities.
-//!
-//! ## Design Overview
-//!
-//! The SSTable implementation consists of three main components:
-//!
-//! ### 1. AsyncIOEntry - Lazy Entry Loading
-//!
-//! `AsyncIOEntry` is a lightweight wrapper that points to an entry's location
-//! in the file without loading the actual data until needed. Key features:
-//! - Minimal memory footprint (~40-50 bytes per entry)
-//! - Caching to avoid repeated I/O for the same entry
-//! - Thread-safe file access through Arc<Mutex<File>>
-//! - Lazy loading of entry data on first access
-//!
-//! ### 2. BlockReader - Block-Level Caching
-//!
-//! `BlockReader` manages a single SSTable block and caches its metadata:
-//! - Pre-loads entry count and offset table during initialization
-//! - Eliminates repeated metadata reads for entries in the same block
-//! - Provides efficient point lookup and iteration within a block
-//! - Creates AsyncIOEntry instances with cached block information
-//!
-//! ### 3. TableReader - Refined Table Management
-//!
-//! The refined `TableReader` design addresses performance issues in the
-//! original implementation:
-//!
-//! **Original Problems:**
-//! - Created AsyncIOEntry instances that repeatedly read block metadata
-//! - File metadata operations for every entry access
-//! - No caching of block-level information
-//! - Inefficient iteration through large tables
-//!
-//! **Refined Solutions:**
-//! - Pre-creates BlockReader instances during TableReader initialization
-//! - BlockReaders cache entry counts and offset tables
-//! - Significantly reduces I/O operations during iteration
-//! - Better memory locality and cache efficiency
-//! - Simplified API that's easier to use and understand
-//!
-//! ## Performance Benefits
-//!
-//! The refined design provides several performance improvements:
-//!
-//! 1. **Reduced I/O Overhead**: Block metadata is read once per block instead
-//!    of once per entry
-//! 2. **Better Caching**: BlockReaders maintain hot data in memory for fast
-//!    access
-//! 3. **Memory Efficiency**: AsyncIOEntry instances remain lightweight while
-//!    providing lazy loading
-//! 4. **Simplified Iteration**: Direct access to entries through pre-loaded
-//!    block readers
-//! 5. **Thread Safety**: Safe concurrent access through Arc<Mutex<File>>
-//!    without data races
-//!
-//! ## Usage Example
-//!
-//! ```rust,ignore
-//! // Open a table - this pre-loads all block readers
-//! let table_reader = TableReader::open("sstable.sst").await?;
-//!
-//! // Point lookup - efficient search through block readers
-//! if let Some(entry) = table_reader.get(&key).await? {
-//!     println!("Found: {:?}", entry);
-//! }
-//!
-//! // Iteration - uses pre-loaded block metadata
-//! let all_entries = table_reader.iter().await?;
-//! for mut io_entry in all_entries {
-//!     let entry = io_entry.entry().await?; // Lazy loading on access
-//!     println!("Entry: {:?}", entry);
-//! }
-//!
-//! // Range queries - efficient filtering using block readers
-//! let range_entries = table_reader.range_iter(&start_key, &end_key).await?;
-//! ```
-//!
-//! This design strikes an optimal balance between memory usage, I/O efficiency,
-//! and code simplicity, making it well-suited for high-performance database
-//! storage.
-
 use std::{
     fs::File,
     io::{Cursor, Read, Seek, Write},
-    mem::MaybeUninit,
     path::Path,
-    sync::{Arc, Mutex},
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -115,8 +28,7 @@ use crate::{
     format::{Codec, Entry, IndexEntry, InternalKey},
     sst::{
         block::{
-            self, BlockEntry, BlockReader, DataBlockBuilder, DataBlockReader, IOEntry,
-            IndexBlockBuilder, IndexBlockReader,
+            BlockEntry, DataBlockBuilder, DataBlockReader, IndexBlockBuilder, IndexBlockReader,
         },
         err::{IOSnafu, IndexChecksumMismatchSnafu, InvalidSSTFileSnafu, Result},
     },
@@ -290,7 +202,7 @@ impl TableBuilder {
     /// Panics if:
     /// - The table builder has been closed
     /// - Entries are not added in sorted order
-    pub(crate) async fn add(&mut self, entry: Entry) -> Result<()> {
+    pub(crate) fn add(&mut self, entry: Entry) -> Result<()> {
         assert!(!self.closed, "TableBuilder has been closed");
 
         // Ensure entries are added in sorted order
@@ -341,7 +253,7 @@ impl TableBuilder {
         let block_data = self
             .data_block
             .build()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
             .context(IOSnafu)?;
 
         // Compute checksum for the block
@@ -408,7 +320,7 @@ impl TableBuilder {
             let index_data = self
                 .index_block
                 .build()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                .map_err(std::io::Error::other)
                 .context(IOSnafu)?;
 
             // Compute index checksum
@@ -799,12 +711,8 @@ mod tests {
         let mut builder = TableBuilder::open(file_path).expect("Failed to open table builder");
 
         for entry in entries {
-            // TableBuilder::add is async, but we need to call it synchronously in tests
-            // For now, let's use a simple approach
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(builder.add(entry))
-                .expect("Failed to add entry");
+            // TableBuilder::add is now synchronous
+            builder.add(entry).expect("Failed to add entry");
         }
 
         builder.finish().expect("Failed to finish table");
