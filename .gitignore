@@ -27,3 +27,6 @@ Cargo.lock
 # Vagrant stuff
 .vagrant
 *.log
+
+# data
+data/

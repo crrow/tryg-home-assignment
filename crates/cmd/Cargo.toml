@@ -11,6 +11,7 @@ clap = { version = "4.4.16", features = ["derive"] }
 const_format = "0.2.32"
 ctrlc = "3.4.2"
 human-panic = "2.0.0"
+rsketch-db = { path = "../db" }
 rsketch-server = { path = "../server" }
 snafu.workspace = true
 tokio = { workspace = true }

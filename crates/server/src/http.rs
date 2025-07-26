@@ -162,6 +162,8 @@ async fn health_check() -> impl IntoResponse { (StatusCode::OK, "OK") }
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+
     use axum::{Json, routing::get};
 
     use super::*;
@@ -172,6 +174,15 @@ mod tests {
             .try_init();
     }
 
+    /// Get an available port by binding to port 0
+    fn get_available_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("Failed to bind to available port")
+            .local_addr()
+            .expect("Failed to get local address")
+            .port()
+    }
+
     async fn hello_handler() -> Json<&'static str> { Json("Hello, World!") }
 
     fn hello_routes(router: Router) -> Router { router.route("/api/v1/hello", get(hello_handler)) }
@@ -180,7 +191,12 @@ mod tests {
     async fn test_rest_server_lifecycle() {
         init_test_logging();
 
-        let config = RestServerConfig::default();
+        let port = get_available_port();
+        let config = RestServerConfig {
+            bind_address:  format!("127.0.0.1:{port}"),
+            max_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+            enable_cors:   true,
+        };
         let handlers: Vec<fn(Router) -> Router> = vec![hello_routes];
 
         let mut handler = start_rest_server(config, handlers).await.unwrap();
@@ -189,19 +205,17 @@ mod tests {
         handler.wait_for_start().await.unwrap();
 
         // Test that the server is running by making a request
-        let client = reqwest::Client::new();
-        let response = client
-            .get("http://127.0.0.1:3000/health")
-            .send()
-            .await
+        let client = reqwest::Client::builder()
+            .no_proxy() // Disable proxy to avoid interference
+            .build()
             .unwrap();
+
+        let health_url = format!("http://127.0.0.1:{port}/health");
+        let response = client.get(&health_url).send().await.unwrap();
         assert_eq!(response.status(), 200);
 
-        let response = client
-            .get("http://127.0.0.1:3000/api/v1/hello")
-            .send()
-            .await
-            .unwrap();
+        let hello_url = format!("http://127.0.0.1:{port}/api/v1/hello");
+        let response = client.get(&hello_url).send().await.unwrap();
         assert_eq!(response.status(), 200);
 
         // Shutdown the server
@@ -213,19 +227,25 @@ mod tests {
     async fn test_rest_server_without_cors() {
         init_test_logging();
 
-        let config = RestServerConfig::default();
+        let port = get_available_port();
+        let config = RestServerConfig {
+            bind_address:  format!("127.0.0.1:{port}"),
+            max_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+            enable_cors:   false,
+        };
         let handlers = vec![hello_routes];
 
         let mut handler = start_rest_server(config, handlers).await.unwrap();
         handler.wait_for_start().await.unwrap();
 
         // Test that the server is running
-        let client = reqwest::Client::new();
-        let response = client
-            .get("http://127.0.0.1:3000/health")
-            .send()
-            .await
+        let client = reqwest::Client::builder()
+            .no_proxy() // Disable proxy to avoid interference
+            .build()
             .unwrap();
+
+        let health_url = format!("http://127.0.0.1:{port}/health");
+        let response = client.get(&health_url).send().await.unwrap();
         assert_eq!(response.status(), 200);
 
         handler.shutdown();
@@ -242,26 +262,29 @@ mod tests {
             router.route("/api/v1/goodbye", get(goodbye_handler))
         }
 
-        let config = RestServerConfig::default();
+        let port = get_available_port();
+        let config = RestServerConfig {
+            bind_address:  format!("127.0.0.1:{port}"),
+            max_body_size: DEFAULT_MAX_HTTP_BODY_SIZE,
+            enable_cors:   true,
+        };
         let handlers = vec![hello_routes, goodbye_routes];
 
         let mut handler = start_rest_server(config, handlers).await.unwrap();
         handler.wait_for_start().await.unwrap();
 
         // Test both routes
-        let client = reqwest::Client::new();
-        let response = client
-            .get("http://127.0.0.1:3000/api/v1/hello")
-            .send()
-            .await
+        let client = reqwest::Client::builder()
+            .no_proxy() // Disable proxy to avoid interference
+            .build()
             .unwrap();
+
+        let hello_url = format!("http://127.0.0.1:{port}/api/v1/hello");
+        let response = client.get(&hello_url).send().await.unwrap();
         assert_eq!(response.status(), 200);
 
-        let response = client
-            .get("http://127.0.0.1:3000/api/v1/goodbye")
-            .send()
-            .await
-            .unwrap();
+        let goodbye_url = format!("http://127.0.0.1:{port}/api/v1/goodbye");
+        let response = client.get(&goodbye_url).send().await.unwrap();
         assert_eq!(response.status(), 200);
 
         handler.shutdown();

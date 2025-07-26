@@ -273,6 +273,15 @@ mod tests {
             .try_init();
     }
 
+    /// Get an available port for testing
+    fn get_available_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
     #[derive(Default)]
     struct HelloService;
 
@@ -321,7 +330,11 @@ mod tests {
     async fn test_grpc_server_lifecycle() {
         init_test_logging();
 
+        let port = get_available_port();
+        let bind_address = format!("127.0.0.1:{port}");
         let config = GrpcServerConfig {
+            bind_address: bind_address.clone(),
+            server_address: Some(bind_address.clone()),
             ..Default::default()
         };
         let mut handle = start_grpc_server(config.clone(), vec![Arc::new(HelloService)])
@@ -361,7 +374,13 @@ mod tests {
         };
 
         // start the server
-        let config = GrpcServerConfig::default();
+        let port = get_available_port();
+        let bind_address = format!("127.0.0.1:{port}");
+        let config = GrpcServerConfig {
+            bind_address: bind_address.clone(),
+            server_address: Some(bind_address.clone()),
+            ..Default::default()
+        };
         let mut handle = start_grpc_server(config.clone(), vec![Arc::new(HelloService)])
             .await
             .expect("start_grpc_server failed");
@@ -370,7 +389,7 @@ mod tests {
         info!("Server started successfully");
 
         // Create a channel and connect to the gRPC server
-        let channel = Channel::from_shared("http://localhost:50051")
+        let channel = Channel::from_shared(format!("http://{bind_address}"))
             .unwrap()
             .connect()
             .await
