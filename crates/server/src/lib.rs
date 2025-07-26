@@ -16,10 +16,20 @@ pub mod grpc;
 pub mod http;
 pub mod services;
 
+use std::sync::Arc;
+
+use axum::Router;
 use futures::future::join_all;
-use snafu::Snafu;
+use rsketch_db::DB;
+use snafu::{ResultExt, Snafu, Whatever};
 use tokio::{sync::oneshot::Receiver, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+
+use crate::{
+    grpc::{GrpcServerConfig, start_grpc_server},
+    http::{RestServerConfig, start_rest_server},
+    services::{store_grpc::StoreSvc, store_rest::create_store_routes},
+};
 
 #[derive(Snafu, Debug)]
 #[snafu(visibility(pub))]
@@ -47,6 +57,80 @@ pub enum NetworkError {
 }
 
 type Result<T> = std::result::Result<T, Error>;
+
+/// Configuration for the time series server
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub host:      String,
+    pub grpc_port: u16,
+    pub http_port: u16,
+    pub db_path:   String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host:      "127.0.0.1".to_string(),
+            grpc_port: 50051,
+            http_port: 3000,
+            db_path:   "./data".to_string(),
+        }
+    }
+}
+
+/// Builder for creating and configuring the time series server
+///
+/// This builder provides a fluent API for setting up both gRPC and HTTP servers
+/// with shared database instance, making it easy to test and configure.
+pub struct ServerBuilder {
+    config: ServerConfig,
+    db:     Arc<DB>,
+}
+
+impl ServerBuilder {
+    /// Creates a new ServerBuilder with a database
+    pub fn new(config: ServerConfig) -> std::result::Result<Self, Whatever> {
+        let db = Arc::new(
+            DB::options(&config.db_path)
+                .open()
+                .whatever_context("Failed to initialize database")?,
+        );
+
+        Ok(Self { config, db })
+    }
+
+    /// Starts both gRPC and HTTP servers
+    ///
+    /// Returns handles for both servers that can be used to manage their
+    /// lifecycle
+    pub async fn start(self) -> std::result::Result<(ServiceHandler, ServiceHandler), Whatever> {
+        // Configure gRPC server
+        let grpc_config = GrpcServerConfig::default()
+            .with_address(format!("{}:{}", self.config.host, self.config.grpc_port));
+
+        // Configure REST server
+        let rest_config = RestServerConfig::builder()
+            .bind_address(format!("{}:{}", self.config.host, self.config.http_port))
+            .max_body_size(crate::http::DEFAULT_MAX_HTTP_BODY_SIZE)
+            .enable_cors(true)
+            .build();
+
+        // Create services with shared database instance
+        let store_grpc_service = Arc::new(StoreSvc::new(self.db.clone()));
+        let store_rest_routes = create_store_routes(self.db);
+
+        // Start both servers
+        let grpc_handle = start_grpc_server(grpc_config, vec![store_grpc_service])
+            .await
+            .whatever_context("Failed to start gRPC server")?;
+
+        let rest_handle = start_rest_server(rest_config, vec![store_rest_routes])
+            .await
+            .whatever_context("Failed to start REST server")?;
+
+        Ok((grpc_handle, rest_handle))
+    }
+}
 
 /// Handle for managing a running service: grpc or http.
 ///

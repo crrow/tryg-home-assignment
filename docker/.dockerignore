@@ -1,0 +1,53 @@
+# Git and version control
+.git
+.gitignore
+
+# Build artifacts
+target/
+# Note: Cargo.lock should NOT be ignored for cargo-chef to work properly
+
+# Documentation
+docs/
+README.md
+*.md
+
+# CI/CD files
+.github/
+.travis.yml
+.appveyor.yml
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Data directories (in case they exist locally)
+data/
+
+# Docker files (to avoid recursive copying)
+Dockerfile*
+.dockerignore
+
+# License and config files that aren't needed for build
+LICENSE
+licenserc.toml
+cliff.toml
+release-plz.toml
+taplo.toml
+rustfmt.toml
+
+# Just task runner
+justfile 

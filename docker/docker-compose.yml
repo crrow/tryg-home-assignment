@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  timeseries-engine:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+    container_name: rsketch-server
+    ports:
+      - "50051:50051"  # gRPC port
+      - "3000:3000"    # HTTP REST port
+    volumes:
+      - timeseries_data:/app/data  # Persistent storage for database
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  test-runner:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.test
+    container_name: rsketch-test
+    depends_on:
+      timeseries-engine:
+        condition: service_healthy
+    environment:
+      - SERVER_URL=http://timeseries-engine:3000
+    command: ["./test_server.sh", "timeseries-engine:3000"]
+    profiles:
+      - test
+
+volumes:
+  timeseries_data:
+    driver: local 

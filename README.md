@@ -17,3 +17,35 @@ Key-value-timestamp store Implement a key-value-timestamp store in whichever pro
 4. Your solution should have defined outcomes for concurrent API calls.
 
 5. Document how to build and run your solution from the command line. For example: "go run main.go".
+
+## Quick Start
+
+### Build and Run
+```bash
+# Build the project
+cargo build --release
+
+# Run the server
+cargo run -- server --host 127.0.0.1 --port 50051 --http-port 3000 --db-path ./data
+```
+
+### Testing
+```bash
+# Quick test of running server
+./scripts/test_server.sh
+
+# Full Docker-based testing
+./scripts/run_tests.sh
+```
+
+## Project Structure
+
+- `crates/` - Rust workspace with multiple crates
+  - `cmd/` - Command-line interface and main entry point
+  - `server/` - HTTP REST and gRPC server implementations
+  - `db/` - Key-value-timestamp database engine
+  - `api/` - Protocol buffer definitions
+  - `common/` - Shared utilities and types
+- `scripts/` - Testing and utility scripts
+- `docker/` - Docker and Docker Compose configurations
+- `data/` - Database storage directory (created at runtime)

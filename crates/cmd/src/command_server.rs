@@ -12,15 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use clap::Args;
-use rsketch_db::DB;
-use rsketch_server::{
-    grpc::{GrpcServerConfig, start_grpc_server},
-    http::{RestServerConfig, start_rest_server},
-    services::{store_grpc::StoreSvc, store_rest::create_store_routes},
-};
+use rsketch_server::ServerBuilder;
 use snafu::{ResultExt, Whatever};
 use tokio::signal;
 use tracing::info;
@@ -66,40 +59,24 @@ pub(crate) async fn run(args: ServerArgs) -> Result<(), Whatever> {
         args.host, args.port, args.host, args.http_port
     );
 
-    // Initialize the database
+    // Create server configuration
+    let config = rsketch_server::ServerConfig {
+        host:      args.host.clone(),
+        grpc_port: args.port,
+        http_port: args.http_port,
+        db_path:   args.db_path.clone(),
+    };
+
     info!("Initializing database at: {}", args.db_path);
-    let db = Arc::new(
-        DB::options(&args.db_path)
-            .open()
-            .whatever_context("Failed to initialize database")?,
-    );
-    info!("Database initialized successfully");
 
-    // Configure gRPC server
-    let grpc_config =
-        GrpcServerConfig::default().with_address(format!("{}:{}", args.host, args.port));
+    // Create and start the server using the builder
+    let server_builder =
+        ServerBuilder::new(config).whatever_context("Failed to create server builder")?;
 
-    // Configure REST server
-    let rest_config = RestServerConfig::builder()
-        .bind_address(format!("{}:{}", args.host, args.http_port))
-        .max_body_size(rsketch_server::http::DEFAULT_MAX_HTTP_BODY_SIZE)
-        .enable_cors(true)
-        .build();
-
-    // Create services with shared database instance
-    let store_grpc_service = Arc::new(StoreSvc::new(db.clone()));
-    let store_rest_routes = create_store_routes(db.clone());
-
-    // Start both servers
-    info!("Starting gRPC server on {}:{}", args.host, args.port);
-    let mut grpc_handle = start_grpc_server(grpc_config, vec![store_grpc_service])
+    let (mut grpc_handle, mut rest_handle) = server_builder
+        .start()
         .await
-        .whatever_context("Failed to start gRPC server")?;
-
-    info!("Starting REST server on {}:{}", args.host, args.http_port);
-    let mut rest_handle = start_rest_server(rest_config, vec![store_rest_routes])
-        .await
-        .whatever_context("Failed to start REST server")?;
+        .whatever_context("Failed to start servers")?;
 
     // Wait for both servers to start
     grpc_handle
@@ -151,10 +128,6 @@ pub(crate) async fn run(args: ServerArgs) -> Result<(), Whatever> {
         .wait_for_stop()
         .await
         .whatever_context("Failed to wait for REST server to stop")?;
-
-    // Close the database
-    info!("Closing database...");
-    db.close().whatever_context("Failed to close database")?;
 
     info!("Server shutdown complete");
     Ok(())

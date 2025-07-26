@@ -1,0 +1,17 @@
+# Test container for running integration tests against the timeseries-engine
+FROM alpine:3.18
+
+# Install curl and bash for running tests
+RUN apk add --no-cache curl bash
+
+# Create app directory
+WORKDIR /app
+
+# Copy the test script
+COPY scripts/test_server.sh .
+
+# Make test script executable
+RUN chmod +x test_server.sh
+
+# Default command runs the test script
+CMD ["./test_server.sh"] 
