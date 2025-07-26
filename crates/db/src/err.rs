@@ -12,10 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod batch;
-pub mod db;
-pub(crate) mod err;
-pub(crate) mod format;
-pub(crate) mod mem;
-pub(crate) mod memtable;
-pub(crate) mod sst;
+use snafu::{Location, Snafu};
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Snafu, Debug)]
+#[snafu(visibility(pub(crate)))]
+pub enum Error {
+    IO {
+        source:   std::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+}

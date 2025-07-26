@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) mod immut;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bon::{Builder, builder};
@@ -33,6 +35,8 @@ pub(crate) struct MemTable {
 }
 
 impl MemTable {
+    pub(crate) fn new() -> Self { Self::builder().build() }
+
     /// Appends a data point to the memtable.
     ///
     /// Returns the new size of the memtable.

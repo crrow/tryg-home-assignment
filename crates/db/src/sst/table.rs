@@ -12,4 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) struct Writer {}
+use crate::sst::block::BlockBuilder;
+
+pub(crate) struct TableBuilder {
+    data_block:  BlockBuilder,
+    index_block: BlockBuilder,
+}

@@ -17,6 +17,8 @@ use std::io::{Read, Write};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use value_log::Slice;
 
+pub(crate) const MANIFEST_FILE: &str = "manifest";
+
 /// Trait to serialize stuff
 pub trait Codec {
     /// Serializes into writer.
@@ -130,10 +132,19 @@ impl Codec for InternalKey {
 impl InternalKey {
     pub fn is_tombstone(&self) -> bool { self.value_type == ValueType::Tombstone }
 
-    pub fn size(&self) -> u64 {
-        self.user_key.key.len() as u64
-            + std::mem::size_of::<u64>() as u64
-            + std::mem::size_of::<u8>() as u64
+    /// Returns the serialized size of this InternalKey in bytes.
+    /// This includes:
+    /// - 8 bytes for seqno (u64)
+    /// - 1 byte for value_type (u8)
+    /// - 8 bytes for timestamp (u64)
+    /// - 8 bytes for key length (u64)
+    /// - N bytes for the key itself
+    pub(crate) fn size(&self) -> u64 {
+        8  // seqno: u64
+        + 1  // value_type: u8
+        + 8  // timestamp: u64
+        + 8  // key length: u64
+        + self.user_key.key.len() as u64 // key bytes
     }
 
     pub fn new<K: Into<UserKey>>(user_key: K, seqno: SeqNo, value_type: ValueType) -> Self {
@@ -186,16 +197,27 @@ pub struct InternalValue {
 }
 
 impl InternalValue {
-    pub fn size(&self) -> u64 { self.key.size() + self.value.len() as u64 }
+    /// Returns the serialized size of this InternalValue in bytes.
+    /// This includes:
+    /// - the serialized size of the key,
+    /// - 8 bytes for the value length (u64),
+    /// - the length of the value itself.
+    pub fn size(&self) -> u64 { self.key.size() + 8 + self.value.len() as u64 }
 
-    pub(crate) fn make(key: &[u8], ts: Timestamp, seqno: SeqNo, value: &[u8]) -> Self {
+    /// Constructs an InternalValue from a key, timestamp, sequence number, and
+    /// value. Accepts both `&[u8]` and `&str` for the value parameter.
+    pub(crate) fn make<K, V>(key: K, ts: Timestamp, seqno: SeqNo, value: V) -> Self
+    where
+        K: AsRef<[u8]>,
+        V: Into<Slice>,
+    {
         Self {
             key:   InternalKey::new(
-                UserKey::builder().key(key).timestamp(ts).build(),
+                UserKey::builder().key(key.as_ref()).timestamp(ts).build(),
                 seqno,
                 ValueType::Value,
             ),
-            value: Slice::from(value),
+            value: value.into(),
         }
     }
 }
@@ -208,5 +230,25 @@ impl std::fmt::Debug for InternalValue {
             self.key,
             str::from_utf8(self.value.as_ref()).unwrap()
         )
+    }
+}
+
+impl Codec for InternalValue {
+    fn encode_into<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        self.key.encode_into(writer)?;
+        writer.write_u64::<LittleEndian>(self.value.len() as u64)?;
+        writer.write_all(&self.value)?;
+        Ok(())
+    }
+
+    fn decode_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let key = InternalKey::decode_from(reader)?;
+        let value_len = reader.read_u64::<LittleEndian>()?;
+        let mut value = vec![0; value_len as usize];
+        reader.read_exact(&mut value)?;
+        Ok(Self {
+            key,
+            value: Slice::from(value),
+        })
     }
 }
