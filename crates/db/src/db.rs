@@ -19,7 +19,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use okaywal::{LogManager, WriteAheadLog};
+use okaywal::WriteAheadLog;
 use snafu::ResultExt;
 use tracing::{debug, info, warn};
 

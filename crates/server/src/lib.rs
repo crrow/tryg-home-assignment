@@ -18,7 +18,6 @@ pub mod services;
 
 use std::sync::Arc;
 
-use axum::Router;
 use futures::future::join_all;
 use rsketch_db::DB;
 use snafu::{ResultExt, Snafu, Whatever};

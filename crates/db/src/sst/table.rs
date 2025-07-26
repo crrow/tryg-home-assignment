@@ -28,7 +28,7 @@ use crate::{
     format::{Codec, Entry, IndexEntry, InternalKey},
     sst::{
         block::{
-            BlockEntry, DataBlockBuilder, DataBlockReader, IndexBlockBuilder, IndexBlockReader,
+            DataBlockBuilder, DataBlockReader, IndexBlockBuilder, IndexBlockReader,
         },
         err::{IOSnafu, IndexChecksumMismatchSnafu, InvalidSSTFileSnafu, Result},
     },
