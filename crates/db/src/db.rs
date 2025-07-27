@@ -37,7 +37,7 @@ const SSTABLE_DIR: &str = "sstables";
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    path:                   PathBuf,
+    path: PathBuf,
     /// Compaction configuration options
     pub compaction_options: CompactionOptions,
 }
@@ -46,7 +46,7 @@ impl Options {
     /// Creates new database options with the given path
     pub fn new<P: Into<PathBuf>>(path: P) -> Self {
         Self {
-            path:               path.into(),
+            path: path.into(),
             compaction_options: CompactionOptions::default(),
         }
     }
@@ -191,20 +191,22 @@ pub struct DB(Arc<DBInner>);
 #[derive(Debug)]
 struct DBInner {
     /// Database root path
-    path:               PathBuf,
+    path: PathBuf,
     /// Memory table manager
-    mem_manager:        MemManagerRef,
+    mem_manager: MemManagerRef,
     /// Write-ahead log for durability
-    wal:                Arc<Mutex<WriteAheadLog>>,
+    wal: Arc<Mutex<WriteAheadLog>>,
     /// Compaction manager for SSTable organization
     compaction_manager: CompactionManagerRef,
     /// SSTable storage directory
-    sstable_dir:        PathBuf,
+    sstable_dir: PathBuf,
 }
 
 impl DB {
     /// Creates a new database options builder
-    pub fn options<P: Into<PathBuf>>(path: P) -> Options { Options::new(path) }
+    pub fn options<P: Into<PathBuf>>(path: P) -> Options {
+        Options::new(path)
+    }
 
     /// Retrieves a value by key at a specific timestamp
     /// Returns the most recent value that is not newer than the given timestamp
@@ -261,7 +263,9 @@ impl DB {
     }
 
     /// Returns database statistics
-    pub fn stats(&self) -> Result<DatabaseStats> { self.0.stats() }
+    pub fn stats(&self) -> Result<DatabaseStats> {
+        self.0.stats()
+    }
 
     /// Performs a range query returning all key-value pairs within the
     /// specified range
@@ -430,11 +434,11 @@ impl DBInner {
     fn search_sstables(&self, key: &[u8], timestamp: u64) -> Result<Option<Vec<u8>>> {
         // Create a search key for comparison
         let search_key = InternalKey {
-            user_key:   crate::format::UserKey {
+            user_key: crate::format::UserKey {
                 key: key.into(),
                 timestamp,
             },
-            seqno:      u64::MAX, // Use max seqno to find any version
+            seqno: u64::MAX, // Use max seqno to find any version
             value_type: crate::format::ValueType::Value,
         };
 
@@ -778,7 +782,7 @@ impl DBInner {
                     &self.path,
                     ManifestEdit::RemoveFile {
                         file_number: file.file_number,
-                        level:       file.level,
+                        level: file.level,
                     },
                 )?;
             }
@@ -822,7 +826,7 @@ impl DBInner {
                     &self.path,
                     ManifestEdit::RemoveFile {
                         file_number: file.file_number,
-                        level:       file.level,
+                        level: file.level,
                     },
                 )?;
             }
@@ -970,59 +974,19 @@ impl DBInner {
         start_time: u64,
         end_time: u64,
     ) -> Result<()> {
-        match TableReader::open(&file_metadata.file_path) {
-            Ok(mut reader) => {
-                // Create range iterator keys
-                let start_internal_key = InternalKey {
-                    user_key:   crate::format::UserKey {
-                        key:       start_key.into(),
-                        timestamp: start_time,
-                    },
-                    seqno:      0,
-                    value_type: crate::format::ValueType::Value,
-                };
-
-                let end_internal_key = InternalKey {
-                    user_key:   crate::format::UserKey {
-                        key:       end_key.into(),
-                        timestamp: end_time,
-                    },
-                    seqno:      u64::MAX,
-                    value_type: crate::format::ValueType::Value,
-                };
-
-                match reader.iter() {
-                    Ok(entries) => {
-                        for entry in entries {
-                            if self.entry_in_range(&entry, start_key, end_key, start_time, end_time)
-                                && !entry.key.is_tombstone()
-                            {
-                                results.push((
-                                    entry.key.user_key.key.as_ref().to_vec(),
-                                    entry.value.as_ref().to_vec(),
-                                    entry.key.user_key.timestamp,
-                                ));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Error reading entries from SSTable file {}: {:?}",
-                            file_metadata.file_path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to open SSTable file {}: {:?}",
-                    file_metadata.file_path.display(),
-                    e
-                );
+        let mut reader = TableReader::open(&file_metadata.file_path)?;
+        let entries = reader.iter()?;
+        for entry in entries {
+            if self.entry_in_range(&entry, start_key, end_key, start_time, end_time)
+                && !entry.key.is_tombstone()
+            {
+                results.push((
+                    entry.key.user_key.key.as_ref().to_vec(),
+                    entry.value.as_ref().to_vec(),
+                    entry.key.user_key.timestamp,
+                ));
             }
         }
-
         Ok(())
     }
 
@@ -1059,11 +1023,11 @@ impl DBInner {
 #[derive(Debug, Clone)]
 pub struct DatabaseStats {
     /// Current memtable size in bytes
-    pub memtable_size:    u64,
+    pub memtable_size: u64,
     /// Memtable size limit in bytes
-    pub memtable_limit:   u64,
+    pub memtable_limit: u64,
     /// Number of immutable memtables
-    pub immutable_count:  usize,
+    pub immutable_count: usize,
     /// Compaction statistics
     pub compaction_stats: crate::compaction::CompactionStats,
 }
