@@ -15,16 +15,16 @@
 use axum::{
     Router, extract::DefaultBodyLimit, http::StatusCode, response::IntoResponse, routing::get,
 };
-use rsketch_common::{
-    error::{ParseAddressSnafu, Result},
-    readable_size::ReadableSize,
-};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
+use tryg_common::{
+    error::{ParseAddressSnafu, Result},
+    readable_size::ReadableSize,
+};
 
 use super::ServiceHandler;
 

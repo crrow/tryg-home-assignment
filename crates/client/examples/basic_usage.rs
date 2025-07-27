@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting embedded server...");
     let server_handle = tokio::spawn(async {
         // Create server configuration
-        let config = rsketch_server::ServerConfig {
+        let config = tryg_server::ServerConfig {
             host:      "127.0.0.1".to_string(),
             grpc_port: 9090,
             http_port: 8080,
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Create and start the server
         let server_builder =
-            rsketch_server::ServerBuilder::new(config).expect("Failed to create server builder");
+            tryg_server::ServerBuilder::new(config).expect("Failed to create server builder");
 
         let (_grpc_handle, _rest_handle) = server_builder
             .start()

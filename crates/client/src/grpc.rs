@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rsketch_api::pb::store::v1::{GetRequest, ListRequest, SetRequest, store_client::StoreClient};
 use snafu::{ResultExt, ensure};
 use tonic::transport::Channel;
 use tracing::{debug, info};
+use tryg_api::pb::store::v1::{GetRequest, ListRequest, SetRequest, store_client::StoreClient};
 
 use crate::types::{ClientError, ClientResult, ListResponse, Series};
 

@@ -71,8 +71,8 @@ pub struct ListResponse {
     pub has_more: bool,
 }
 
-impl From<rsketch_api::pb::store::v1::Series> for Series {
-    fn from(grpc_series: rsketch_api::pb::store::v1::Series) -> Self {
+impl From<tryg_api::pb::store::v1::Series> for Series {
+    fn from(grpc_series: tryg_api::pb::store::v1::Series) -> Self {
         Series {
             key:       grpc_series.key,
             value:     grpc_series.value,
@@ -81,9 +81,9 @@ impl From<rsketch_api::pb::store::v1::Series> for Series {
     }
 }
 
-impl From<Series> for rsketch_api::pb::store::v1::Series {
+impl From<Series> for tryg_api::pb::store::v1::Series {
     fn from(series: Series) -> Self {
-        rsketch_api::pb::store::v1::Series {
+        tryg_api::pb::store::v1::Series {
             key:       series.key,
             value:     series.value,
             timestamp: series.timestamp,
@@ -91,8 +91,8 @@ impl From<Series> for rsketch_api::pb::store::v1::Series {
     }
 }
 
-impl From<rsketch_api::pb::store::v1::ListResponse> for ListResponse {
-    fn from(grpc_response: rsketch_api::pb::store::v1::ListResponse) -> Self {
+impl From<tryg_api::pb::store::v1::ListResponse> for ListResponse {
+    fn from(grpc_response: tryg_api::pb::store::v1::ListResponse) -> Self {
         ListResponse {
             series:   grpc_response.series.into_iter().map(Series::from).collect(),
             has_more: grpc_response.has_more,

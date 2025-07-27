@@ -19,10 +19,10 @@ pub mod services;
 use std::sync::Arc;
 
 use futures::future::join_all;
-use rsketch_db::DB;
 use snafu::{ResultExt, Snafu, Whatever};
 use tokio::{sync::oneshot::Receiver, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+use tryg_db::DB;
 
 use crate::{
     grpc::{GrpcServerConfig, start_grpc_server},

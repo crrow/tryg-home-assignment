@@ -21,9 +21,9 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use rsketch_db::DB;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
+use tryg_db::DB;
 
 /// REST Store service implementation
 ///
@@ -108,7 +108,7 @@ impl StoreRestService {
         &self,
         key_prefix: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<Series>, rsketch_db::Error> {
+    ) -> Result<Vec<Series>, tryg_db::Error> {
         // Use a very wide range to get all data
         let start_key = key_prefix.map(|p| p.as_bytes()).unwrap_or(&[]);
         let end_key = if let Some(prefix) = key_prefix {
@@ -177,7 +177,7 @@ impl StoreRestService {
     }
 
     /// Converts database errors to HTTP error responses
-    fn db_error_to_response(error: rsketch_db::Error) -> impl IntoResponse {
+    fn db_error_to_response(error: tryg_db::Error) -> impl IntoResponse {
         error!("Database error: {:?}", error);
         (
             StatusCode::INTERNAL_SERVER_ERROR,

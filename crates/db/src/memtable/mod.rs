@@ -29,19 +29,17 @@ use crate::format::{Entry, InternalKey, SeqNo, Timestamp, UserKey, UserValue};
 pub(crate) struct MemTable {
     // The series in this memtable, keyed by series_ref.
     #[builder(default = SkipMap::new())]
-    items: SkipMap<InternalKey, UserValue>,
+    items:            SkipMap<InternalKey, UserValue>,
     // The approximate size of memtable in bytes.
     #[builder(default = AtomicU64::new(0))]
     approximate_size: AtomicU64,
     /// seqno is used for mvcc.
     #[builder(default = AtomicU64::new(0))]
-    highest_seqno: AtomicU64,
+    highest_seqno:    AtomicU64,
 }
 
 impl MemTable {
-    pub(crate) fn new() -> Self {
-        Self::builder().build()
-    }
+    pub(crate) fn new() -> Self { Self::builder().build() }
 
     /// Appends a data point to the memtable.
     ///
@@ -59,7 +57,7 @@ impl MemTable {
     /// Creates an iterator over all items.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = Entry> + '_ {
         self.items.iter().map(|entry| Entry {
-            key: entry.key().clone(),
+            key:   entry.key().clone(),
             value: entry.value().clone(),
         })
     }
@@ -119,7 +117,7 @@ impl MemTable {
 
                     if is_better {
                         best_match = Some(Entry {
-                            key: found_key.clone(),
+                            key:   found_key.clone(),
                             value: entry.value().clone(),
                         });
                     }

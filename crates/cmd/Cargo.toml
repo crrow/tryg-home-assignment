@@ -1,5 +1,5 @@
 [package]
-name = "rsketch-cmd"
+name = "tryg-cmd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,12 +11,12 @@ clap = { version = "4.4.16", features = ["derive"] }
 const_format = "0.2.32"
 ctrlc = "3.4.2"
 human-panic = "2.0.0"
-rsketch-db = { path = "../db" }
-rsketch-server = { path = "../server" }
 snafu.workspace = true
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tryg-db = { path = "../db" }
+tryg-server = { path = "../server" }
 
 [build-dependencies]
 built = { version = "0.8.0", features = ["git2"] }

@@ -342,3 +342,138 @@ impl Codec for IndexEntry {
         })
     }
 }
+
+/// Represents an SSTable file in the manifest
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ManifestEntry {
+    /// Unique file identifier
+    pub file_number:   u64,
+    /// File size in bytes
+    pub file_size:     u64,
+    /// Level this file belongs to (0 = L0, 1 = L1, etc.)
+    pub level:         usize,
+    /// Number of entries in the file
+    pub entry_count:   u32,
+    /// Smallest key in the file (serialized)
+    pub smallest_key:  Option<Vec<u8>>,
+    /// Largest key in the file (serialized)
+    pub largest_key:   Option<Vec<u8>>,
+    /// When the file was created (timestamp)
+    pub creation_time: u64,
+}
+
+impl Codec for ManifestEntry {
+    fn encode_into<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        writer.write_u64::<LittleEndian>(self.file_number)?;
+        writer.write_u64::<LittleEndian>(self.file_size)?;
+        writer.write_u64::<LittleEndian>(self.level as u64)?;
+        writer.write_u32::<LittleEndian>(self.entry_count)?;
+        writer.write_u64::<LittleEndian>(self.creation_time)?;
+
+        // Encode smallest key
+        if let Some(ref key) = self.smallest_key {
+            writer.write_u8(1)?; // has key
+            writer.write_u64::<LittleEndian>(key.len() as u64)?;
+            writer.write_all(key)?;
+        } else {
+            writer.write_u8(0)?; // no key
+        }
+
+        // Encode largest key
+        if let Some(ref key) = self.largest_key {
+            writer.write_u8(1)?; // has key
+            writer.write_u64::<LittleEndian>(key.len() as u64)?;
+            writer.write_all(key)?;
+        } else {
+            writer.write_u8(0)?; // no key
+        }
+
+        Ok(())
+    }
+
+    fn decode_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let file_number = reader.read_u64::<LittleEndian>()?;
+        let file_size = reader.read_u64::<LittleEndian>()?;
+        let level = reader.read_u64::<LittleEndian>()? as usize;
+        let entry_count = reader.read_u32::<LittleEndian>()?;
+        let creation_time = reader.read_u64::<LittleEndian>()?;
+
+        // Decode smallest key
+        let smallest_key = if reader.read_u8()? == 1 {
+            let key_len = reader.read_u64::<LittleEndian>()?;
+            let mut key = vec![0; key_len as usize];
+            reader.read_exact(&mut key)?;
+            Some(key)
+        } else {
+            None
+        };
+
+        // Decode largest key
+        let largest_key = if reader.read_u8()? == 1 {
+            let key_len = reader.read_u64::<LittleEndian>()?;
+            let mut key = vec![0; key_len as usize];
+            reader.read_exact(&mut key)?;
+            Some(key)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            file_number,
+            file_size,
+            level,
+            entry_count,
+            smallest_key,
+            largest_key,
+            creation_time,
+        })
+    }
+}
+
+/// Represents an edit operation in the manifest
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ManifestEdit {
+    /// Add a new SSTable file
+    AddFile(ManifestEntry),
+    /// Remove an SSTable file
+    RemoveFile {
+        file_number: u64,
+        level:       usize,
+    },
+}
+
+impl Codec for ManifestEdit {
+    fn encode_into<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        match self {
+            ManifestEdit::AddFile(entry) => {
+                writer.write_u8(0)?; // AddFile tag
+                entry.encode_into(writer)?;
+            }
+            ManifestEdit::RemoveFile { file_number, level } => {
+                writer.write_u8(1)?; // RemoveFile tag
+                writer.write_u64::<LittleEndian>(*file_number)?;
+                writer.write_u64::<LittleEndian>(*level as u64)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_from<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let tag = reader.read_u8()?;
+        match tag {
+            0 => {
+                let entry = ManifestEntry::decode_from(reader)?;
+                Ok(ManifestEdit::AddFile(entry))
+            }
+            1 => {
+                let file_number = reader.read_u64::<LittleEndian>()?;
+                let level = reader.read_u64::<LittleEndian>()? as usize;
+                Ok(ManifestEdit::RemoveFile { file_number, level })
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid manifest edit tag: {tag}"),
+            )),
+        }
+    }
+}

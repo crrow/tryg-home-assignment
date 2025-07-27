@@ -14,12 +14,12 @@
 
 use std::sync::Arc;
 
-use rsketch_api::pb::store::v1::{
-    GetRequest, GetResponse, ListRequest, ListResponse, Series, SetRequest,
-};
-use rsketch_db::DB;
 use tonic::{Request, Response, Status, service::RoutesBuilder};
 use tracing::{debug, error, warn};
+use tryg_api::pb::store::v1::{
+    GetRequest, GetResponse, ListRequest, ListResponse, Series, SetRequest,
+};
+use tryg_db::DB;
 
 use crate::grpc::GrpcServiceHandler;
 
@@ -55,7 +55,7 @@ impl StoreSvc {
         &self,
         key_prefix: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<Series>, rsketch_db::Error> {
+    ) -> Result<Vec<Series>, tryg_db::Error> {
         // Use a very wide range to get all data
         let start_key = key_prefix.map(|p| p.as_bytes()).unwrap_or(&[]);
         let end_key = if let Some(prefix) = key_prefix {
@@ -124,14 +124,14 @@ impl StoreSvc {
     }
 
     /// Converts database errors to gRPC Status errors
-    fn db_error_to_status(error: rsketch_db::Error) -> Status {
+    fn db_error_to_status(error: tryg_db::Error) -> Status {
         error!("Database error: {:?}", error);
         Status::internal(format!("Database operation failed: {error}"))
     }
 }
 
 #[async_trait::async_trait]
-impl rsketch_api::pb::store::v1::store_server::Store for StoreSvc {
+impl tryg_api::pb::store::v1::store_server::Store for StoreSvc {
     /// Retrieves a value by key, optionally at a specific timestamp
     ///
     /// If no timestamp is provided, returns the latest value.
@@ -272,7 +272,7 @@ impl rsketch_api::pb::store::v1::store_server::Store for StoreSvc {
 impl GrpcServiceHandler for StoreSvc {
     fn service_name(&self) -> &'static str { "Store" }
 
-    fn file_descriptor_set(&self) -> &'static [u8] { rsketch_api::pb::GRPC_DESC }
+    fn file_descriptor_set(&self) -> &'static [u8] { tryg_api::pb::GRPC_DESC }
 
     fn register_service(self: &Arc<Self>, builder: &mut RoutesBuilder) {
         use tonic::service::LayerExt as _;
@@ -281,7 +281,7 @@ impl GrpcServiceHandler for StoreSvc {
             .layer(tonic_web::GrpcWebLayer::new())
             .into_inner()
             .named_layer(
-                rsketch_api::pb::store::v1::store_server::StoreServer::from_arc(self.clone()),
+                tryg_api::pb::store::v1::store_server::StoreServer::from_arc(self.clone()),
             );
         builder.add_service(svc);
     }

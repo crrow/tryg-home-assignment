@@ -1,5 +1,5 @@
 [package]
-name = "rsketch-db"
+name = "tryg-db"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,7 +15,6 @@ derive_more.workspace = true
 fusio.workspace = true
 okaywal = "^0.3.1"
 rangemap.workspace = true
-rsketch-common = { path = "../common" }
 serde.workspace = true
 snafu.workspace = true
 strum.workspace = true
@@ -23,6 +22,8 @@ strum_macros.workspace = true
 test-case.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+tryg-common = { path = "../common" }
 value-log = "^1.9.0"
 
 [dev-dependencies]

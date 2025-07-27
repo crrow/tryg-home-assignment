@@ -27,7 +27,7 @@ use crate::{
     batch::WriteBatch,
     compaction::{CompactionManager, CompactionManagerRef, CompactionOptions, SstableMetadata},
     err::{IOSnafu, Result},
-    format::{Entry, InternalKey, MANIFEST_FILE},
+    format::{Codec, Entry, InternalKey, MANIFEST_FILE, ManifestEdit, ManifestEntry},
     mem::{MemManagerRef, open_wal},
     sst::table::{TableBuilder, TableReader},
 };
@@ -96,12 +96,38 @@ impl Options {
         ));
 
         // Recover SSTable files from disk
-        let sstable_files = discover_sstable_files(&sstable_dir)?;
+        let sstable_files = discover_sstable_files(&self.path, &sstable_dir)?;
+        let mut total_recovered = 0;
+        let mut manifest_needs_rebuilding = false;
+
         for (level, files) in sstable_files {
+            let file_count = files.len();
             for file_metadata in files {
                 compaction_manager.add_file(file_metadata)?;
             }
-            info!("Recovered {} SSTable files at level {}", level, level);
+            total_recovered += file_count;
+            info!("Recovered {} SSTable files at level {}", file_count, level);
+        }
+
+        // If we discovered files but the manifest was empty/legacy, rebuild it
+        if total_recovered > 0 {
+            let manifest_path = self.path.join(MANIFEST_FILE);
+            if !manifest_path.exists() {
+                manifest_needs_rebuilding = true;
+            } else {
+                let existing_data = fs::read(&manifest_path).context(IOSnafu)?;
+                if existing_data.is_empty() || existing_data.starts_with(b"#") {
+                    manifest_needs_rebuilding = true;
+                }
+            }
+        }
+
+        if manifest_needs_rebuilding {
+            info!(
+                "Rebuilding manifest file from {} discovered SSTable files",
+                total_recovered
+            );
+            rebuild_manifest_from_compaction_manager(&self.path, &compaction_manager)?;
         }
 
         // Open and recover WAL (this will replay logged operations)
@@ -690,8 +716,13 @@ impl DBInner {
             );
         }
 
-        // Add all flushed files to the compaction manager at L0
+        // Add all flushed files to the compaction manager at L0 and persist to manifest
         for file_metadata in flushed_files {
+            // Persist to manifest first
+            let manifest_entry = sstable_metadata_to_manifest_entry(&file_metadata)?;
+            write_manifest_edit(&self.path, ManifestEdit::AddFile(manifest_entry))?;
+
+            // Then add to compaction manager
             self.compaction_manager.add_file(file_metadata)?;
         }
 
@@ -740,12 +771,30 @@ impl DBInner {
             // For now, run it synchronously
             let output_files = self.compaction_manager.compact(job.clone())?;
 
-            // Add output files and remove input files
+            // Persist manifest changes first
+            // Remove input files from manifest
+            for file in job.all_input_files() {
+                write_manifest_edit(
+                    &self.path,
+                    ManifestEdit::RemoveFile {
+                        file_number: file.file_number,
+                        level:       file.level,
+                    },
+                )?;
+            }
+
+            // Add output files to manifest
+            for file in &output_files {
+                let manifest_entry = sstable_metadata_to_manifest_entry(file)?;
+                write_manifest_edit(&self.path, ManifestEdit::AddFile(manifest_entry))?;
+            }
+
+            // Update compaction manager state
             for file in output_files {
                 self.compaction_manager.add_file(file)?;
             }
 
-            // Remove input files
+            // Remove input files from compaction manager
             self.compaction_manager.remove_files(
                 &job.input_files
                     .into_iter()
@@ -766,7 +815,25 @@ impl DBInner {
 
             let output_files = self.compaction_manager.compact(job.clone())?;
 
-            // Update file organization
+            // Persist manifest changes
+            // Remove input files from manifest
+            for file in job.all_input_files() {
+                write_manifest_edit(
+                    &self.path,
+                    ManifestEdit::RemoveFile {
+                        file_number: file.file_number,
+                        level:       file.level,
+                    },
+                )?;
+            }
+
+            // Add output files to manifest
+            for file in &output_files {
+                let manifest_entry = sstable_metadata_to_manifest_entry(file)?;
+                write_manifest_edit(&self.path, ManifestEdit::AddFile(manifest_entry))?;
+            }
+
+            // Update compaction manager state
             for file in output_files {
                 self.compaction_manager.add_file(file)?;
             }
@@ -1001,9 +1068,228 @@ pub struct DatabaseStats {
     pub compaction_stats: crate::compaction::CompactionStats,
 }
 
+/// Reads the manifest file and returns SSTable metadata organized by level
+fn read_manifest_file(db_path: &PathBuf) -> Result<HashMap<usize, Vec<SstableMetadata>>> {
+    let manifest_path = db_path.join(MANIFEST_FILE);
+    let mut files_by_level = HashMap::new();
+
+    if !manifest_path.exists() {
+        return Ok(files_by_level);
+    }
+
+    let manifest_data = fs::read(&manifest_path).context(IOSnafu)?;
+    if manifest_data.is_empty() || manifest_data.starts_with(b"#") {
+        // Empty or legacy manifest file
+        return Ok(files_by_level);
+    }
+
+    let mut cursor = std::io::Cursor::new(manifest_data);
+
+    // Read manifest entries until EOF
+    while cursor.position() < cursor.get_ref().len() as u64 {
+        match ManifestEdit::decode_from(&mut cursor) {
+            Ok(edit) => {
+                match edit {
+                    ManifestEdit::AddFile(entry) => {
+                        // Convert ManifestEntry to SstableMetadata
+                        if let Some(metadata) = manifest_entry_to_sstable_metadata(entry, db_path)?
+                        {
+                            files_by_level
+                                .entry(metadata.level)
+                                .or_insert_with(Vec::new)
+                                .push(metadata);
+                        }
+                    }
+                    ManifestEdit::RemoveFile { file_number, level } => {
+                        // Remove the file from the level
+                        if let Some(files) = files_by_level.get_mut(&level) {
+                            files.retain(|f| f.file_number != file_number);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Error reading manifest entry: {:?}", e);
+                break; // Stop reading on error
+            }
+        }
+    }
+
+    // Sort files within each level
+    for files in files_by_level.values_mut() {
+        files.sort_by_key(|f| f.file_number);
+    }
+
+    Ok(files_by_level)
+}
+
+/// Converts a ManifestEntry to SstableMetadata
+fn manifest_entry_to_sstable_metadata(
+    entry: ManifestEntry,
+    db_path: &PathBuf,
+) -> Result<Option<SstableMetadata>> {
+    let file_name = format!("{:06}.sst", entry.file_number);
+    let file_path = db_path.join(SSTABLE_DIR).join(file_name);
+
+    // Check if the file actually exists on disk
+    if !file_path.exists() {
+        warn!(
+            "SSTable file {} referenced in manifest but not found on disk",
+            file_path.display()
+        );
+        return Ok(None);
+    }
+
+    // Convert serialized keys back to InternalKey
+    let smallest_key = if let Some(key_bytes) = entry.smallest_key {
+        let mut cursor = std::io::Cursor::new(key_bytes);
+        InternalKey::decode_from(&mut cursor).ok()
+    } else {
+        None
+    };
+
+    let largest_key = if let Some(key_bytes) = entry.largest_key {
+        let mut cursor = std::io::Cursor::new(key_bytes);
+        InternalKey::decode_from(&mut cursor).ok()
+    } else {
+        None
+    };
+
+    let metadata = SstableMetadata {
+        file_number: entry.file_number,
+        file_path,
+        file_size: entry.file_size,
+        smallest_key,
+        largest_key,
+        level: entry.level,
+        entry_count: entry.entry_count,
+        creation_time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.creation_time),
+    };
+
+    Ok(Some(metadata))
+}
+
+/// Writes a manifest edit to the manifest file
+fn write_manifest_edit(db_path: &PathBuf, edit: ManifestEdit) -> Result<()> {
+    let manifest_path = db_path.join(MANIFEST_FILE);
+
+    // If this is the first edit and the manifest is legacy (text-based), create a
+    // new binary manifest
+    if manifest_path.exists() {
+        let existing_data = fs::read(&manifest_path).context(IOSnafu)?;
+        if existing_data.starts_with(b"#") {
+            // Legacy manifest, start fresh with binary format
+            let mut new_data = Vec::new();
+            edit.encode_into(&mut new_data).context(IOSnafu)?;
+            fs::write(&manifest_path, new_data).context(IOSnafu)?;
+            return Ok(());
+        }
+    }
+
+    // Append the edit to the existing binary manifest
+    let mut encoded_edit = Vec::new();
+    edit.encode_into(&mut encoded_edit).context(IOSnafu)?;
+
+    use std::{fs::OpenOptions, io::Write};
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&manifest_path)
+        .context(IOSnafu)?;
+
+    file.write_all(&encoded_edit).context(IOSnafu)?;
+    file.sync_all().context(IOSnafu)?;
+
+    Ok(())
+}
+
+/// Converts SstableMetadata to ManifestEntry for persistence
+fn sstable_metadata_to_manifest_entry(metadata: &SstableMetadata) -> Result<ManifestEntry> {
+    // Serialize keys for storage
+    let smallest_key = if let Some(ref key) = metadata.smallest_key {
+        let mut buffer = Vec::new();
+        key.encode_into(&mut buffer).context(IOSnafu)?;
+        Some(buffer)
+    } else {
+        None
+    };
+
+    let largest_key = if let Some(ref key) = metadata.largest_key {
+        let mut buffer = Vec::new();
+        key.encode_into(&mut buffer).context(IOSnafu)?;
+        Some(buffer)
+    } else {
+        None
+    };
+
+    let creation_time = metadata
+        .creation_time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    Ok(ManifestEntry {
+        file_number: metadata.file_number,
+        file_size: metadata.file_size,
+        level: metadata.level,
+        entry_count: metadata.entry_count,
+        smallest_key,
+        largest_key,
+        creation_time,
+    })
+}
+
+/// Rebuilds the manifest file from the current state of the compaction manager
+fn rebuild_manifest_from_compaction_manager(
+    db_path: &PathBuf,
+    compaction_manager: &CompactionManager,
+) -> Result<()> {
+    let manifest_path = db_path.join(MANIFEST_FILE);
+
+    // Remove existing manifest
+    if manifest_path.exists() {
+        fs::remove_file(&manifest_path).context(IOSnafu)?;
+    }
+
+    // Get all files from all levels
+    let compaction_stats = compaction_manager.stats()?;
+
+    for level_stat in &compaction_stats.level_stats {
+        if level_stat.file_count > 0 {
+            let files = compaction_manager.get_level_files(level_stat.level)?;
+            for file_metadata in files {
+                let manifest_entry = sstable_metadata_to_manifest_entry(&file_metadata)?;
+                write_manifest_edit(db_path, ManifestEdit::AddFile(manifest_entry))?;
+            }
+        }
+    }
+
+    info!(
+        "Rebuilt manifest file with {} levels",
+        compaction_stats.level_stats.len()
+    );
+    Ok(())
+}
+
 /// Discovers SSTable files in the database directory and organizes them by
-/// level
-fn discover_sstable_files(sstable_dir: &PathBuf) -> Result<HashMap<usize, Vec<SstableMetadata>>> {
+/// level. Falls back to filesystem discovery if manifest is unavailable.
+fn discover_sstable_files(
+    db_path: &PathBuf,
+    sstable_dir: &PathBuf,
+) -> Result<HashMap<usize, Vec<SstableMetadata>>> {
+    // First try to read from manifest
+    let manifest_files = read_manifest_file(db_path)?;
+    if !manifest_files.is_empty() {
+        info!(
+            "Loaded {} SSTable files from manifest",
+            manifest_files.values().map(|v| v.len()).sum::<usize>()
+        );
+        return Ok(manifest_files);
+    }
+
+    // Fall back to filesystem discovery
+    warn!("Manifest file not found or empty, falling back to filesystem discovery");
     let mut files_by_level = HashMap::new();
 
     if !sstable_dir.exists() {
@@ -1030,6 +1316,44 @@ fn discover_sstable_files(sstable_dir: &PathBuf) -> Result<HashMap<usize, Vec<Ss
     }
 
     Ok(files_by_level)
+}
+
+/// Infers the SSTable level based on file metadata (fallback heuristic)
+fn infer_sstable_level(file_metadata: &std::fs::Metadata) -> Result<usize> {
+    // Simple heuristic: smaller and newer files are more likely to be L0
+    // This is a best-effort guess when manifest is not available
+
+    let file_size = file_metadata.len();
+    let age = file_metadata
+        .created()
+        .or_else(|_| file_metadata.modified())
+        .unwrap_or(std::time::SystemTime::now())
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let age_hours = (now - age) / 3600;
+
+    // Heuristic rules:
+    // - Files created in the last hour: L0
+    // - Small files (< 64MB): L0 or L1
+    // - Medium files (64MB - 256MB): L1 or L2
+    // - Large files (> 256MB): L2+
+    let level = match (file_size, age_hours) {
+        (_, 0..=1) => 0,                         // Very recent files -> L0
+        (0..67_108_864, _) => 0,                 // < 64MB -> L0
+        (67_108_864..=268_435_456, 0..=24) => 1, // 64-256MB, < 1 day -> L1
+        (67_108_864..=268_435_456, _) => 2,      // 64-256MB, older -> L2
+        (_, 0..=24) => 1,                        // Large but recent -> L1
+        _ => 2,                                  // Large and old -> L2
+    };
+
+    Ok(level)
 }
 
 /// Attempts to read metadata from an SSTable file
@@ -1061,9 +1385,11 @@ fn try_read_sstable_metadata(path: &PathBuf) -> Result<Option<SstableMetadata>> 
         Ok(reader) => {
             let file_size = fs::metadata(path).context(IOSnafu)?.len();
 
-            // For now, assume all recovered files are at L0
-            // In a real implementation, this would be stored in the manifest
-            let level = 0;
+            // For filesystem discovery, try to infer level from file age and size
+            // Newer/smaller files are more likely to be L0, older/larger files at higher
+            // levels
+            let file_metadata = fs::metadata(path).context(IOSnafu)?;
+            let level = infer_sstable_level(&file_metadata)?;
 
             let metadata = SstableMetadata {
                 file_number,
@@ -1378,6 +1704,7 @@ mod tests {
 
             // Close database properly
             db.close().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
         // Test database recovery
@@ -1548,5 +1875,114 @@ mod tests {
         // Should get nothing when querying before any version
         let none = db.get(key, 500).unwrap();
         assert_eq!(none, None); // Should return None for timestamp before any data
+    }
+
+    #[test]
+    fn test_manifest_persistence_and_recovery() {
+        use tracing::Level;
+        use tracing_subscriber;
+        // Initialize tracing
+        tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+        let temp_dir = TempDir::new().unwrap();
+
+        // Phase 1: Create database and add data that will trigger compaction
+        {
+            let db = DB::options(temp_dir.path()).open().unwrap();
+
+            // Add enough data to trigger memtable rotation and flush
+            for i in 0..50 {
+                let key = format!("manifest_test_key{i:03}");
+                let value = format!("manifest_test_value{i:03}");
+                db.put(key.as_bytes(), value.as_bytes(), i * 1000).unwrap();
+            }
+
+            // Force flush to create SSTable files
+            db.flush().unwrap();
+
+            // Force compaction to move files between levels
+            db.compact().unwrap();
+
+            db.close().unwrap();
+        }
+
+        // Phase 2: Verify manifest file exists and has content
+        let manifest_path = temp_dir.path().join(MANIFEST_FILE);
+        assert!(manifest_path.exists(), "Manifest file should exist");
+
+        let manifest_data = std::fs::read(&manifest_path).unwrap();
+        assert!(
+            !manifest_data.is_empty(),
+            "Manifest file should have content"
+        );
+        assert!(
+            !manifest_data.starts_with(b"#"),
+            "Manifest should be binary format, not legacy text"
+        );
+
+        // Phase 3: Recover database and verify data is accessible
+        {
+            let db = DB::options(temp_dir.path()).open().unwrap();
+
+            // Verify we can still read all the data
+            for i in 0..50 {
+                let key = format!("manifest_test_key{i:03}");
+                let expected_value = format!("manifest_test_value{i:03}");
+                let actual_value = db.get(key.as_bytes(), i * 1000).unwrap();
+
+                assert_eq!(
+                    actual_value,
+                    Some(expected_value.into_bytes()),
+                    "Data should be recoverable after manifest-based recovery"
+                );
+            }
+
+            // Verify that database stats show files across multiple levels
+            let stats = db.stats().unwrap();
+            let mut total_files = 0;
+            let mut levels_with_files = 0;
+
+            for level_stat in &stats.compaction_stats.level_stats {
+                if level_stat.file_count > 0 {
+                    total_files += level_stat.file_count;
+                    levels_with_files += 1;
+                }
+            }
+
+            assert!(total_files > 0, "Should have recovered SSTable files");
+            // After compaction, we might have files in multiple levels
+            println!("Recovered {total_files} files across {levels_with_files} levels");
+
+            db.close().unwrap();
+        }
+
+        // Phase 4: Test that manifest edits are properly applied on subsequent
+        // operations
+        {
+            let db = DB::options(temp_dir.path()).open().unwrap();
+
+            // Add more data to trigger another flush/compaction cycle
+            for i in 50..60 {
+                let key = format!("manifest_test_key{i:03}");
+                let value = format!("manifest_test_value{i:03}");
+                db.put(key.as_bytes(), value.as_bytes(), i * 1000).unwrap();
+            }
+
+            db.flush().unwrap();
+
+            // Verify all data is still accessible
+            for i in 0..60 {
+                let key = format!("manifest_test_key{i:03}");
+                let expected_value = format!("manifest_test_value{i:03}");
+                let actual_value = db.get(key.as_bytes(), i * 1000).unwrap();
+
+                assert_eq!(
+                    actual_value,
+                    Some(expected_value.into_bytes()),
+                    "All data should remain accessible after adding more data"
+                );
+            }
+
+            db.close().unwrap();
+        }
     }
 }

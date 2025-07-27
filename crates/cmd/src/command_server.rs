@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use clap::Args;
-use rsketch_server::ServerBuilder;
 use snafu::{ResultExt, Whatever};
 use tokio::signal;
 use tracing::info;
+use tryg_server::ServerBuilder;
 
 #[derive(Debug, Clone, Args)]
 #[command(
@@ -60,7 +60,7 @@ pub(crate) async fn run(args: ServerArgs) -> Result<(), Whatever> {
     );
 
     // Create server configuration
-    let config = rsketch_server::ServerConfig {
+    let config = tryg_server::ServerConfig {
         host:      args.host.clone(),
         grpc_port: args.port,
         http_port: args.http_port,

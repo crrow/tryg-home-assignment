@@ -20,8 +20,8 @@ use std::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
-use rsketch_common::readable_size::ReadableSize;
 use snafu::{ResultExt, ensure};
+use tryg_common::readable_size::ReadableSize;
 use value_log::Slice;
 
 use crate::{

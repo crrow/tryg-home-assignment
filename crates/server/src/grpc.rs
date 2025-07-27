@@ -15,10 +15,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rsketch_common::{
-    error::{ParseAddressSnafu, Result},
-    readable_size::ReadableSize,
-};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use tokio::sync::oneshot;
@@ -27,6 +23,10 @@ use tonic::{service::RoutesBuilder, transport::Server};
 use tonic_health::server::HealthReporter;
 use tonic_reflection::server::v1::{ServerReflection, ServerReflectionServer};
 use tracing::info;
+use tryg_common::{
+    error::{ParseAddressSnafu, Result},
+    readable_size::ReadableSize,
+};
 
 use crate::ServiceHandler;
 
@@ -286,7 +286,7 @@ mod tests {
     struct HelloService;
 
     #[async_trait::async_trait]
-    impl rsketch_api::pb::hello::v1::hello_server::Hello for HelloService {
+    impl tryg_api::pb::hello::v1::hello_server::Hello for HelloService {
         async fn hello(
             &self,
             _request: tonic::Request<()>,
@@ -299,7 +299,7 @@ mod tests {
     impl GrpcServiceHandler for HelloService {
         fn service_name(&self) -> &'static str { "Hello" }
 
-        fn file_descriptor_set(&self) -> &'static [u8] { rsketch_api::pb::GRPC_DESC }
+        fn file_descriptor_set(&self) -> &'static [u8] { tryg_api::pb::GRPC_DESC }
 
         fn register_service(self: &Arc<Self>, builder: &mut RoutesBuilder) {
             use tonic::service::LayerExt as _;
@@ -308,7 +308,7 @@ mod tests {
                 .layer(tonic_web::GrpcWebLayer::new())
                 .into_inner()
                 .named_layer(
-                    rsketch_api::pb::hello::v1::hello_server::HelloServer::from_arc(self.clone()),
+                    tryg_api::pb::hello::v1::hello_server::HelloServer::from_arc(self.clone()),
                 );
             builder.add_service(svc);
         }
@@ -320,8 +320,7 @@ mod tests {
         ) {
             // Register the Hello service as healthy
             reporter
-                .set_serving::<rsketch_api::pb::hello::v1::hello_server::HelloServer<HelloService>>(
-                )
+                .set_serving::<tryg_api::pb::hello::v1::hello_server::HelloServer<HelloService>>()
                 .await;
         }
     }
@@ -346,7 +345,7 @@ mod tests {
         info!("Server started successfully");
 
         // Create a gRPC client and send an RPC request
-        let mut client = rsketch_api::pb::hello::v1::hello_client::HelloClient::connect(format!(
+        let mut client = tryg_api::pb::hello::v1::hello_client::HelloClient::connect(format!(
             "http://{}",
             config.server_address.unwrap()
         ))
