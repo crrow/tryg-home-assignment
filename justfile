@@ -46,8 +46,7 @@ alias t := test
 @docker-build:
     # Build Docker image with BuildKit optimizations and proxy support
     cd docker && DOCKER_BUILDKIT=1 docker build \
-      --build-arg HTTP_PROXY=http://10.0.0.1:7890 \
-      --build-arg HTTPS_PROXY=http://10.0.0.1:7890 \
+    
       --build-arg NO_PROXY=localhost,127.0.0.1 \
       -f Dockerfile -t rsketch-server ..
 
@@ -76,11 +75,11 @@ alias t := test
 # Docker Compose commands
 @docker-up:
     # Start services with docker-compose
-    cd docker && DOCKER_BUILDKIT=1 HTTP_PROXY=http://10.0.0.1:7890 HTTPS_PROXY=http://10.0.0.1:7890 docker-compose up --build
+    cd docker && DOCKER_BUILDKIT=1 docker-compose up --build
 
 @docker-up-bg:
     # Start services in background with docker-compose
-    cd docker && DOCKER_BUILDKIT=1 HTTP_PROXY=http://10.0.0.1:7890 HTTPS_PROXY=http://10.0.0.1:7890 docker-compose up -d --build
+    cd docker && DOCKER_BUILDKIT=1 docker-compose up -d --build
 
 @docker-down:
     # Stop docker-compose services

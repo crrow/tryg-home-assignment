@@ -44,30 +44,6 @@ docker-compose --profile test run --rm test-runner
 docker-compose down
 ```
 
-## Test Coverage
-
-The automated tests validate:
-- ✅ Health endpoint
-- ✅ Store time series data (multiple sensors)
-- ✅ Retrieve data by timestamp
-- ✅ Time series behavior (latest value before timestamp)
-- ✅ Error handling (404, 400)
-- ✅ Performance (bulk operations)
-
-## Docker Compose Services
-
-### `timeseries-engine`
-- **Purpose**: Main server container
-- **Ports**: 50051 (gRPC), 3000 (HTTP)
-- **Health Check**: Validates `/health` endpoint
-- **Data**: Persisted in Docker volume `timeseries_data`
-
-### `test-runner` (profile: test)
-- **Purpose**: Runs integration tests against the server
-- **Dependencies**: Waits for `timeseries-engine` to be healthy
-- **Base Image**: Alpine Linux with curl and bash
-- **Test Script**: `scripts/test_server.sh`
-
 ## Files
 
 - `docker-compose.yml` - Main compose configuration

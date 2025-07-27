@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
-use rsketch_api::pb::store::v1::{GetRequest, GetResponse, Series, SetRequest};
+use rsketch_api::pb::store::v1::{
+    GetRequest, GetResponse, ListRequest, ListResponse, Series, SetRequest,
+};
 use rsketch_db::DB;
 use tonic::{Request, Response, Status, service::RoutesBuilder};
 use tracing::{debug, error, warn};
@@ -45,6 +47,80 @@ impl StoreSvc {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64
+    }
+
+    /// Gets all unique keys from the database by performing a full range scan
+    /// Returns the latest value for each key
+    fn get_all_keys_with_latest_values(
+        &self,
+        key_prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Series>, rsketch_db::Error> {
+        // Use a very wide range to get all data
+        let start_key = key_prefix.map(|p| p.as_bytes()).unwrap_or(&[]);
+        let end_key = if let Some(prefix) = key_prefix {
+            // Create end key by incrementing the last byte of the prefix
+            let mut end = prefix.as_bytes().to_vec();
+            if let Some(last_byte) = end.last_mut() {
+                if *last_byte == 255 {
+                    // If last byte is 255, we can't increment it, so use a longer prefix
+                    end.push(0);
+                } else {
+                    *last_byte += 1;
+                }
+            }
+            end
+        } else {
+            vec![255; 64] // Use a sufficiently large end key for full range
+        };
+
+        // Get all data from the beginning of time to now
+        let entries = self
+            .db
+            .range(start_key, &end_key, 0, Self::current_timestamp())?;
+
+        // Group by key and keep only the latest entry for each key
+        use std::collections::HashMap;
+        let mut latest_by_key: HashMap<Vec<u8>, (Vec<u8>, u64)> = HashMap::new();
+
+        for (key, value, timestamp) in entries {
+            match latest_by_key.entry(key.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((value, timestamp));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let (_, existing_timestamp) = entry.get();
+                    if timestamp > *existing_timestamp {
+                        entry.insert((value, timestamp));
+                    }
+                }
+            }
+        }
+
+        // Convert to Series and sort by key
+        let mut series_list: Vec<Series> = latest_by_key
+            .into_iter()
+            .filter_map(|(key_bytes, (value_bytes, timestamp))| {
+                // Convert bytes to strings
+                let key = String::from_utf8(key_bytes).ok()?;
+                let value = String::from_utf8(value_bytes).ok()?;
+                Some(Series {
+                    key,
+                    value,
+                    timestamp: timestamp as i64,
+                })
+            })
+            .collect();
+
+        // Sort by key for consistent ordering
+        series_list.sort_by(|a, b| a.key.cmp(&b.key));
+
+        // Apply limit
+        if series_list.len() > limit {
+            series_list.truncate(limit);
+        }
+
+        Ok(series_list)
     }
 
     /// Converts database errors to gRPC Status errors
@@ -138,6 +214,54 @@ impl rsketch_api::pb::store::v1::store_server::Store for StoreSvc {
                     series.key, series.value, series.timestamp
                 );
                 Ok(Response::new(()))
+            }
+            Err(e) => Err(Self::db_error_to_status(e)),
+        }
+    }
+
+    /// Lists all stored keys with their latest values
+    ///
+    /// Optionally filters by key prefix and applies a limit to the number of
+    /// results. Returns the latest value for each unique key.
+    async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
+        let req = request.into_inner();
+
+        debug!(
+            "Received list request with prefix: {:?}, limit: {:?}",
+            req.key_prefix, req.limit
+        );
+
+        // Validate and set limit (default: 100, max: 1000)
+        let limit = req.limit.unwrap_or(100) as usize;
+        if limit > 1000 {
+            return Err(Status::invalid_argument("Limit cannot exceed 1000"));
+        }
+        if limit == 0 {
+            return Err(Status::invalid_argument("Limit must be greater than 0"));
+        }
+
+        // Get key prefix if provided
+        let key_prefix = req.key_prefix.as_deref();
+
+        // Retrieve all keys with their latest values
+        match self.get_all_keys_with_latest_values(key_prefix, limit + 1) {
+            Ok(mut series_list) => {
+                // Check if there are more results than the limit
+                let has_more = series_list.len() > limit;
+                if has_more {
+                    series_list.pop(); // Remove the extra item we fetched
+                }
+
+                debug!(
+                    "Returning {} series, has_more: {}",
+                    series_list.len(),
+                    has_more
+                );
+
+                Ok(Response::new(ListResponse {
+                    series: series_list,
+                    has_more,
+                }))
             }
             Err(e) => Err(Self::db_error_to_status(e)),
         }

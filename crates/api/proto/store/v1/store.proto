@@ -23,6 +23,7 @@ import "google/protobuf/empty.proto";
 service Store {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Set(SetRequest) returns (google.protobuf.Empty);
+  rpc List(ListRequest) returns (ListResponse);
 }
 
 message Series {
@@ -43,5 +44,18 @@ message GetResponse {
 
 message SetRequest {
     Series series = 1;
+}
+
+message ListRequest {
+    // Optional key prefix to filter results
+    optional string key_prefix = 1;
+    // Optional limit on number of results (default: 100, max: 1000)
+    optional int32 limit = 2;
+}
+
+message ListResponse {
+    repeated Series series = 1;
+    // Indicates if there are more results available
+    bool has_more = 2;
 }
 

@@ -51,6 +51,15 @@ pub struct GetQueryParams {
     pub timestamp: Option<i64>,
 }
 
+/// Query parameters for list requests
+#[derive(Debug, Deserialize)]
+pub struct ListQueryParams {
+    /// Optional key prefix to filter results
+    pub key_prefix: Option<String>,
+    /// Optional limit on number of results (default: 100, max: 1000)
+    pub limit:      Option<i32>,
+}
+
 /// Request body for set operations
 #[derive(Debug, Deserialize)]
 pub struct SetRequest {
@@ -61,6 +70,13 @@ pub struct SetRequest {
 #[derive(Debug, Serialize)]
 pub struct GetResponse {
     pub series: Series,
+}
+
+/// Response structure for list operations
+#[derive(Debug, Serialize)]
+pub struct ListResponse {
+    pub series:   Vec<Series>,
+    pub has_more: bool,
 }
 
 /// Error response structure
@@ -84,6 +100,80 @@ impl StoreRestService {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64
+    }
+
+    /// Gets all unique keys from the database by performing a full range scan
+    /// Returns the latest value for each key
+    fn get_all_keys_with_latest_values(
+        &self,
+        key_prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Series>, rsketch_db::Error> {
+        // Use a very wide range to get all data
+        let start_key = key_prefix.map(|p| p.as_bytes()).unwrap_or(&[]);
+        let end_key = if let Some(prefix) = key_prefix {
+            // Create end key by incrementing the last byte of the prefix
+            let mut end = prefix.as_bytes().to_vec();
+            if let Some(last_byte) = end.last_mut() {
+                if *last_byte == 255 {
+                    // If last byte is 255, we can't increment it, so use a longer prefix
+                    end.push(0);
+                } else {
+                    *last_byte += 1;
+                }
+            }
+            end
+        } else {
+            vec![255; 64] // Use a sufficiently large end key for full range
+        };
+
+        // Get all data from the beginning of time to now
+        let entries = self
+            .db
+            .range(start_key, &end_key, 0, Self::current_timestamp())?;
+
+        // Group by key and keep only the latest entry for each key
+        use std::collections::HashMap;
+        let mut latest_by_key: HashMap<Vec<u8>, (Vec<u8>, u64)> = HashMap::new();
+
+        for (key, value, timestamp) in entries {
+            match latest_by_key.entry(key.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((value, timestamp));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let (_, existing_timestamp) = entry.get();
+                    if timestamp > *existing_timestamp {
+                        entry.insert((value, timestamp));
+                    }
+                }
+            }
+        }
+
+        // Convert to Series and sort by key
+        let mut series_list: Vec<Series> = latest_by_key
+            .into_iter()
+            .filter_map(|(key_bytes, (value_bytes, timestamp))| {
+                // Convert bytes to strings
+                let key = String::from_utf8(key_bytes).ok()?;
+                let value = String::from_utf8(value_bytes).ok()?;
+                Some(Series {
+                    key,
+                    value,
+                    timestamp: timestamp as i64,
+                })
+            })
+            .collect();
+
+        // Sort by key for consistent ordering
+        series_list.sort_by(|a, b| a.key.cmp(&b.key));
+
+        // Apply limit
+        if series_list.len() > limit {
+            series_list.truncate(limit);
+        }
+
+        Ok(series_list)
     }
 
     /// Converts database errors to HTTP error responses
@@ -224,6 +314,74 @@ async fn set_handler(
     }
 }
 
+/// HTTP GET handler for listing all stored keys with their latest values
+///
+/// GET /api/v1/store?key_prefix=<optional_prefix>&limit=<optional_limit>
+///
+/// Query parameters:
+/// - key_prefix: Optional prefix to filter keys
+/// - limit: Optional limit on number of results (default: 100, max: 1000)
+///
+/// Returns a JSON object with an array of series and a has_more flag
+async fn list_handler(
+    Query(params): Query<ListQueryParams>,
+    State(service): State<StoreRestService>,
+) -> impl IntoResponse {
+    debug!(
+        "Received list request with prefix: {:?}, limit: {:?}",
+        params.key_prefix, params.limit
+    );
+
+    // Validate and set limit (default: 100, max: 1000)
+    let limit = params.limit.unwrap_or(100) as usize;
+    if limit > 1000 {
+        return StoreRestService::error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidLimit",
+            "Limit cannot exceed 1000",
+        )
+        .into_response();
+    }
+    if limit == 0 {
+        return StoreRestService::error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidLimit",
+            "Limit must be greater than 0",
+        )
+        .into_response();
+    }
+
+    // Get key prefix if provided
+    let key_prefix = params.key_prefix.as_deref();
+
+    // Retrieve all keys with their latest values
+    match service.get_all_keys_with_latest_values(key_prefix, limit + 1) {
+        Ok(mut series_list) => {
+            // Check if there are more results than the limit
+            let has_more = series_list.len() > limit;
+            if has_more {
+                series_list.pop(); // Remove the extra item we fetched
+            }
+
+            debug!(
+                "Returning {} series, has_more: {}",
+                series_list.len(),
+                has_more
+            );
+
+            (
+                StatusCode::OK,
+                Json(ListResponse {
+                    series: series_list,
+                    has_more,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => StoreRestService::db_error_to_response(e).into_response(),
+    }
+}
+
 /// Creates the REST API routes for the Store service
 ///
 /// This function returns a router configuration function that can be
@@ -242,6 +400,7 @@ pub fn create_store_routes(db: Arc<DB>) -> impl Fn(Router) -> Router + Send + Sy
         let store_router = Router::new()
             .route("/api/v1/store/{key}", get(get_handler))
             .route("/api/v1/store", post(set_handler))
+            .route("/api/v1/store", get(list_handler))
             .with_state(service);
 
         router.merge(store_router)

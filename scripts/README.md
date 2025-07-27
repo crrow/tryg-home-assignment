@@ -16,14 +16,6 @@ This directory contains utility scripts for testing and managing the timeseries-
 ./scripts/test_server.sh myserver.com:8080
 ```
 
-**What it tests**:
-- ✅ Health endpoint
-- ✅ Store time series data (multiple sensors)
-- ✅ Retrieve data by timestamp
-- ✅ Time series behavior (latest value before timestamp)
-- ✅ Error handling (404, 400)
-- ✅ Performance (bulk operations)
-
 **Requirements**: `curl`, `bash`
 
 ### `run_tests.sh`
@@ -73,48 +65,3 @@ docker-compose --profile test run --rm test-runner
 # Cleanup
 docker-compose down
 ```
-
-## Output Examples
-
-**Successful test run**:
-```
-🧪 Testing timeseries-engine server at http://localhost:3000
-================================================
-1. Basic Health Check
---------------------
-Testing Health endpoint... ✓ PASS (HTTP 200)
-
-2. Store Data Tests
-------------------
-Testing Store temperature data... ✓ PASS (HTTP 200)
-[...]
-
-📊 Test Results
-===============
-Tests run: 10
-Tests passed: 10
-Tests failed: 0
-🎉 All tests passed!
-```
-
-**Failed test**:
-```
-Testing Health endpoint... ✗ FAIL (Expected HTTP 200, got HTTP 502)
-   Response: 
-```
-
-## Adding New Tests
-
-To add new tests to `test_server.sh`:
-
-1. Add test cases in the appropriate section
-2. Use the helper functions:
-   - `run_test "description" "expected_status" "url"`
-   - `run_test_with_json "description" "expected_status" "json_data" "url"`
-3. Update the test count logic if needed
-
-Example:
-```bash
-# Add to the appropriate section
-run_test "Get sensor list" "200" "$BASE_URL/api/v1/sensors"
-``` 
