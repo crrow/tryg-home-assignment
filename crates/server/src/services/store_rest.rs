@@ -23,7 +23,7 @@ use axum::{
 };
 use rsketch_db::DB;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// REST Store service implementation
 ///
@@ -394,15 +394,19 @@ async fn list_handler(
 /// A function that takes a Router and returns a Router with store routes added
 pub fn create_store_routes(db: Arc<DB>) -> impl Fn(Router) -> Router + Send + Sync + 'static {
     move |router: Router| -> Router {
+        info!("Creating store REST routes");
         let service = StoreRestService::new(db.clone());
 
         // Create a sub-router with state, then merge it with the main router
         let store_router = Router::new()
             .route("/api/v1/store/{key}", get(get_handler))
             .route("/api/v1/store", post(set_handler))
-            .route("/api/v1/store", get(list_handler))
+            .route("/api/v1/store/list", get(list_handler))
             .with_state(service);
 
-        router.merge(store_router)
+        info!("Store routes created, merging with main router");
+        let merged_router = router.merge(store_router);
+        info!("Store routes merged successfully");
+        merged_router
     }
 }

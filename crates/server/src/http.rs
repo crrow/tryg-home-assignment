@@ -122,7 +122,10 @@ where
     for handler in route_handlers.iter() {
         info!("Registering REST route handler");
         router = handler(router);
+        info!("REST route handler registered successfully");
     }
+
+    info!("Final router setup complete, spawning server task");
 
     // Spawn the server task
     let cancellation_token = CancellationToken::new();

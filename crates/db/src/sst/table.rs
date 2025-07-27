@@ -27,9 +27,7 @@ use value_log::Slice;
 use crate::{
     format::{Codec, Entry, IndexEntry, InternalKey},
     sst::{
-        block::{
-            DataBlockBuilder, DataBlockReader, IndexBlockBuilder, IndexBlockReader,
-        },
+        block::{DataBlockBuilder, DataBlockReader, IndexBlockBuilder, IndexBlockReader},
         err::{IOSnafu, IndexChecksumMismatchSnafu, InvalidSSTFileSnafu, Result},
     },
 };

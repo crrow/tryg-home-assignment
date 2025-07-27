@@ -27,6 +27,9 @@ cargo build --release
 
 # Run the server
 cargo run -- server --host 127.0.0.1 --port 50051 --http-port 3000 --db-path ./data
+
+# Run the example
+cargo run --example basic_usage
 ```
 
 ### Testing
@@ -41,6 +44,7 @@ cargo run -- server --host 127.0.0.1 --port 50051 --http-port 3000 --db-path ./d
 ## Project Structure
 
 - `crates/` - Rust workspace with multiple crates
+  - `client/` - Simple Http & Grpc Client
   - `cmd/` - Command-line interface and main entry point
   - `server/` - HTTP REST and gRPC server implementations
   - `db/` - Key-value-timestamp database engine

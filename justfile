@@ -45,10 +45,7 @@ alias t := test
 # Docker commands
 @docker-build:
     # Build Docker image with BuildKit optimizations and proxy support
-    cd docker && DOCKER_BUILDKIT=1 docker build \
-    
-      --build-arg NO_PROXY=localhost,127.0.0.1 \
-      -f Dockerfile -t rsketch-server ..
+    cd docker && DOCKER_BUILDKIT=1 docker build -f Dockerfile -t rsketch-server ..
 
 @docker-build-no-proxy:
     # Build Docker image without proxy (for users without proxy)
