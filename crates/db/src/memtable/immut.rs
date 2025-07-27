@@ -1,3 +1,7 @@
+// Copyright (c) 2024-present, fjall-rs
+// This source code is licensed under both the Apache 2.0 and MIT License
+// (found in the LICENSE-* files in the repository)
+//
 // Copyright 2025 Crrow
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
